@@ -1,0 +1,21 @@
+# Copy to terraform.tfvars and fill in the account-specific values.
+#
+# Backend configuration is passed at init time so no account identifiers are
+# committed:
+#
+#   terraform init \
+#     -backend-config="bucket=my-terraform-state" \
+#     -backend-config="key=integration-orchestrator/dev.tfstate" \
+#     -backend-config="region=us-east-1" \
+#     -backend-config="dynamodb_table=my-terraform-locks"
+
+region             = "us-east-1"
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+image           = "123456789012.dkr.ecr.us-east-1.amazonaws.com/integration-orchestrator:0.1.0"
+certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+
+ingress_cidr_blocks = ["10.20.0.0/16"]
+
+otlp_endpoint    = "http://otel-collector.internal:4317"
+alarm_topic_arns = []

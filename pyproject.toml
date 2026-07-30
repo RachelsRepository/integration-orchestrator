@@ -1,0 +1,213 @@
+[project]
+name = "integration-orchestrator"
+version = "0.1.0"
+description = "Production-style integration platform demonstrating provider abstraction, OAuth2, resilient API orchestration, webhook processing, idempotency, retries, circuit breakers, reconciliation, observability, and event-driven architecture."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "redis>=5.2.0",
+    "aiokafka>=0.12.0",
+    "httpx>=0.27.2",
+    "pyjwt>=2.10.0",
+    "cryptography>=43.0.0",
+    "prometheus-client>=0.21.0",
+    "opentelemetry-api>=1.28.0",
+    "opentelemetry-sdk>=1.28.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.28.0",
+    "opentelemetry-instrumentation-fastapi>=0.49b0",
+    "opentelemetry-instrumentation-httpx>=0.49b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.49b0",
+    "opentelemetry-instrumentation-asyncpg>=0.49b0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "import-linter>=2.1",
+    "testcontainers[postgres,redis]>=4.8.0",
+    "asgi-lifespan>=2.1.0",
+]
+
+[project.scripts]
+integration-orchestrator = "integration_orchestrator.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/integration_orchestrator"]
+
+[tool.uv]
+default-groups = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # unused arguments
+    "SIM",    # flake8-simplify
+    "TCH",    # type-checking imports
+    "PTH",    # use pathlib
+    "RUF",    # ruff-specific
+    "ASYNC",  # flake8-async
+    "S",      # bandit
+    "DTZ",    # naive datetime detection
+    "T20",    # no print
+    "RET",    # return simplification
+    "PL",     # pylint subset
+]
+ignore = [
+    "PLR0913",  # many arguments: dependency-injected constructors legitimately take several
+    "PLR0917",  # many positional arguments: FastAPI handlers and DI constructors
+    "PLR0911",  # many returns: decision trees in domain and error classification
+    "PLR2004",  # magic value comparison: noisy in policy/threshold code
+    "S101",     # assert: used deliberately in tests and invariants
+    "B008",     # function call in default argument: required by FastAPI Depends()
+    "TC001",    # first-party imports in TYPE_CHECKING: fights runtime DI annotations
+    "TC002",    # third-party imports in TYPE_CHECKING: same
+    "TC003",    # stdlib imports in TYPE_CHECKING: same
+    "PLC0415",  # import not at top level: used for optional/sandbox deferred imports
+    "PLW0603",  # global statement: tracing provider lifecycle is process-scoped
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S311", "PLR0915", "ARG001", "ARG002"]
+"scripts/**" = ["T20", "S105", "S106"]
+"src/integration_orchestrator/cli.py" = ["T20"]
+"src/integration_orchestrator/infrastructure/providers/sandbox/**" = ["S105", "S106"]
+"src/integration_orchestrator/infrastructure/redis/**" = ["S105"]
+"src/integration_orchestrator/application/ports/security.py" = ["S105"]
+"src/integration_orchestrator/api/**" = ["ARG001"]
+"src/integration_orchestrator/observability/metrics.py" = ["ARG002"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["integration_orchestrator"]
+
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["pydantic.BaseModel", "pydantic_settings.BaseSettings"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["integration_orchestrator"]
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+disallow_any_generics = true
+no_implicit_reexport = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["aiokafka.*", "testcontainers.*", "opentelemetry.instrumentation.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+# ``src`` so the suite runs from a source checkout even when the editable
+# install is not active; the repository root so the shared test doubles under
+# ``tests.support`` are importable from every test module.
+pythonpath = ["src", "."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "unit: fast isolated tests with no external dependencies",
+    "integration: tests requiring PostgreSQL or Redis containers",
+    "contract: provider adapter conformance tests",
+    "e2e: full workflow tests through the API",
+    "kafka: tests requiring a running Kafka broker",
+]
+filterwarnings = ["error", "ignore::DeprecationWarning:aiokafka.*"]
+
+[tool.coverage.run]
+source = ["src/integration_orchestrator"]
+branch = true
+omit = ["*/migrations/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
+
+[tool.importlinter]
+root_packages = ["integration_orchestrator"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Domain depends on nothing but the standard library"
+type = "forbidden"
+source_modules = ["integration_orchestrator.domain"]
+forbidden_modules = [
+    "integration_orchestrator.application",
+    "integration_orchestrator.infrastructure",
+    "integration_orchestrator.api",
+    "integration_orchestrator.workers",
+    "integration_orchestrator.config",
+    "integration_orchestrator.observability",
+    "fastapi",
+    "sqlalchemy",
+    "redis",
+    "aiokafka",
+    "httpx",
+    "pydantic",
+]
+
+[[tool.importlinter.contracts]]
+name = "Application depends only on the domain"
+type = "forbidden"
+source_modules = ["integration_orchestrator.application"]
+forbidden_modules = [
+    "integration_orchestrator.infrastructure",
+    "integration_orchestrator.api",
+    "integration_orchestrator.workers",
+    "fastapi",
+    "sqlalchemy",
+    "redis",
+    "aiokafka",
+    "httpx",
+]
+
+[[tool.importlinter.contracts]]
+name = "Layers are strictly ordered"
+type = "layers"
+layers = [
+    "integration_orchestrator.api",
+    "integration_orchestrator.infrastructure",
+    "integration_orchestrator.application",
+    "integration_orchestrator.domain",
+]
+exhaustive = false
+
+[[tool.importlinter.contracts]]
+name = "Infrastructure never imports the API layer"
+type = "forbidden"
+source_modules = ["integration_orchestrator.infrastructure"]
+forbidden_modules = ["integration_orchestrator.api"]

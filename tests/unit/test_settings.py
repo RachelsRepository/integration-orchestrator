@@ -1,0 +1,184 @@
+"""Configuration validation.
+
+The production-safety validator is the one that matters: it is what stops a
+deployment starting with a development placeholder still in place, which is a
+failure mode no amount of code review reliably catches.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from pydantic import SecretStr, ValidationError
+
+from integration_orchestrator.config.settings import (
+    Environment,
+    KafkaSettings,
+    ProviderSandboxSettings,
+    ProviderSettings,
+    Settings,
+    get_settings,
+    reset_settings_cache,
+)
+
+pytestmark = pytest.mark.unit
+
+
+def production(**overrides: object) -> Settings:
+    """Build a production-shaped configuration that passes every safety rule."""
+    base: dict[str, object] = {
+        "environment": Environment.PRODUCTION,
+        "provider_sandbox": ProviderSandboxSettings(enabled=False, mount_in_app=False),
+        "log_console_renderer": False,
+        "jwt": {"secret": SecretStr("a-real-signing-secret-from-the-secrets-manager")},
+        "providers": {
+            "northstar": ProviderSettings(
+                display_name="Northstar Connect",
+                base_url="https://api.northstar.test",
+                client_secret=SecretStr("rotated-northstar-credential"),
+                webhook_secret=SecretStr("rotated-northstar-webhook"),
+            ),
+            "meridian": ProviderSettings(enabled=False),
+            "cobalt": ProviderSettings(enabled=False),
+        },
+    }
+    base.update(overrides)
+    return Settings(**base)  # type: ignore[arg-type]
+
+
+def test_local_defaults_construct_without_configuration() -> None:
+    settings = Settings()
+
+    assert settings.environment is Environment.LOCAL
+    assert set(settings.providers) == {"northstar", "meridian", "cobalt"}
+
+
+def test_a_production_configuration_with_real_values_is_accepted() -> None:
+    assert production().environment is Environment.PRODUCTION
+
+
+def test_the_provider_sandbox_cannot_run_in_production() -> None:
+    with pytest.raises(ValidationError, match="sandbox"):
+        production(provider_sandbox=ProviderSandboxSettings(enabled=True, mount_in_app=False))
+
+
+def test_a_placeholder_jwt_secret_stops_production_starting() -> None:
+    with pytest.raises(ValidationError, match="JWT__SECRET"):
+        production(jwt={"secret": SecretStr("local-development-signing-secret")})
+
+
+def test_a_placeholder_provider_credential_stops_production_starting() -> None:
+    with pytest.raises(ValidationError, match="client_secret"):
+        production(
+            providers={
+                "northstar": ProviderSettings(
+                    base_url="https://api.northstar.test",
+                    client_secret=SecretStr("northstar-local-secret"),
+                )
+            }
+        )
+
+
+def test_a_provider_still_pointing_at_localhost_stops_production_starting() -> None:
+    with pytest.raises(ValidationError, match="local base URL"):
+        production(
+            providers={"northstar": ProviderSettings(base_url="http://localhost:8000/__sandbox__")}
+        )
+
+
+def test_a_disabled_provider_is_not_held_to_production_rules() -> None:
+    """A provider nobody is using should not block a deployment."""
+    settings = production(
+        providers={
+            "northstar": ProviderSettings(
+                display_name="Northstar Connect",
+                base_url="https://api.northstar.test",
+                client_secret=SecretStr("rotated-northstar-credential"),
+                webhook_secret=SecretStr("rotated-northstar-webhook"),
+            ),
+            "meridian": ProviderSettings(enabled=False, base_url="http://localhost:8000"),
+            "cobalt": ProviderSettings(enabled=False),
+        }
+    )
+
+    assert settings.enabled_providers().keys() == {"northstar"}
+
+
+def test_console_logging_cannot_be_enabled_in_production() -> None:
+    with pytest.raises(ValidationError, match="JSON"):
+        production(log_console_renderer=True)
+
+
+def test_the_in_memory_publisher_cannot_be_selected_in_production() -> None:
+    """Publishing into a process-local list would be silent event loss."""
+    with pytest.raises(ValidationError, match="Kafka"):
+        production(kafka=KafkaSettings(enabled=False))
+
+
+def test_database_echo_cannot_be_enabled_in_production() -> None:
+    with pytest.raises(ValidationError, match="echoing"):
+        production(database={"echo": True})
+
+
+def test_local_environments_are_free_to_use_placeholders() -> None:
+    settings = Settings(environment=Environment.LOCAL)
+
+    assert settings.provider_sandbox.enabled is True
+
+
+def test_partial_provider_overrides_keep_the_rest_of_the_defaults() -> None:
+    """Pydantic replaces the whole dict, so the merge has to be explicit."""
+    settings = Settings(providers={"northstar": ProviderSettings(total_timeout_seconds=99.0)})
+
+    northstar = settings.provider("northstar")
+    assert northstar.total_timeout_seconds == 99.0
+    assert northstar.display_name == "Northstar Connect"
+    assert "meridian" in settings.providers
+
+
+def test_an_unknown_provider_lookup_raises_a_key_error() -> None:
+    with pytest.raises(KeyError):
+        Settings().provider("nonexistent")
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected"),
+    [
+        ("integration.request.succeeded.v1", "integration.request"),
+        ("provider.circuit.opened.v1", "provider.circuit"),
+        ("short", "integration.short"),
+    ],
+)
+def test_lifecycle_events_for_one_aggregate_share_a_topic(event_type: str, expected: str) -> None:
+    assert KafkaSettings().topic_for(event_type) == expected
+
+
+def test_the_alembic_url_uses_a_synchronous_driver() -> None:
+    """Alembic's runner is synchronous; handing it an asyncpg URL fails at import."""
+    settings = Settings()
+
+    assert "+asyncpg" not in settings.database.sync_url
+
+
+def test_describing_the_configuration_never_reveals_a_secret() -> None:
+    """`config` is meant to be safe to paste into an incident channel."""
+    settings = Settings(
+        jwt={"secret": SecretStr("the-real-signing-key")},
+        providers={"meridian": ProviderSettings(api_key=SecretStr("the-real-api-key"))},
+    )
+
+    rendered = json.dumps(settings.describe())
+
+    assert "the-real-signing-key" not in rendered
+    assert "the-real-api-key" not in rendered
+    assert rendered.count("**********") >= 2
+    assert "Meridian Services" in rendered
+
+
+def test_settings_are_parsed_once_per_process() -> None:
+    reset_settings_cache()
+    try:
+        assert get_settings() is get_settings()
+    finally:
+        reset_settings_cache()
