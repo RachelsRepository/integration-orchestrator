@@ -154,11 +154,36 @@ def test_lifecycle_events_for_one_aggregate_share_a_topic(event_type: str, expec
     assert KafkaSettings().topic_for(event_type) == expected
 
 
-def test_the_alembic_url_uses_a_synchronous_driver() -> None:
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql+asyncpg://user:p%40ss@db.example:5433/database?sslmode=require",
+        "postgresql://user:p%40ss@db.example:5433/database?sslmode=require",
+        "postgresql+psycopg://user:p%40ss@db.example:5433/database?sslmode=require",
+        "postgresql+psycopg2://user:p%40ss@db.example:5433/database?sslmode=require",
+    ],
+)
+def test_the_alembic_url_uses_a_synchronous_driver(database_url: str) -> None:
     """Alembic's runner is synchronous; handing it an asyncpg URL fails at import."""
-    settings = Settings()
+    settings = Settings(database={"url": database_url})
 
-    assert "+asyncpg" not in settings.database.sync_url
+    assert settings.database.sync_url == (
+        "postgresql+psycopg://user:p%40ss@db.example:5433/database?sslmode=require"
+    )
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql://user:password@localhost/database",
+        "postgresql+psycopg://user:password@localhost/database",
+        "postgresql+psycopg2://user:password@localhost/database",
+    ],
+)
+def test_application_database_urls_always_use_asyncpg(database_url: str) -> None:
+    settings = Settings(database={"url": database_url})
+
+    assert settings.database.url == "postgresql+asyncpg://user:password@localhost/database"
 
 
 def test_describing_the_configuration_never_reveals_a_secret() -> None:

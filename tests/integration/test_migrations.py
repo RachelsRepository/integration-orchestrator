@@ -18,7 +18,7 @@ from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import create_engine, text
 
-from integration_orchestrator.config.settings import reset_settings_cache
+from integration_orchestrator.config.settings import DatabaseSettings, reset_settings_cache
 from integration_orchestrator.infrastructure.db.models import Base
 
 pytestmark = pytest.mark.integration
@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.fixture(scope="module")
 def migrated_database_url(database_url: str) -> str:
     """Apply every revision to a blank database and return a sync URL."""
-    sync_url = _as_sync_url(database_url)
+    sync_url = DatabaseSettings(url=database_url).sync_url
     engine = create_engine(sync_url)
     try:
         with engine.begin() as connection:
@@ -97,10 +97,3 @@ def test_the_partial_outbox_index_only_covers_unpublished_rows(
 
     assert "WHERE" in definition
     assert "published_at IS NULL" in definition
-
-
-def _as_sync_url(url: str) -> str:
-    for prefix in ("postgresql+asyncpg://", "postgresql+psycopg://"):
-        if url.startswith(prefix):
-            return "postgresql://" + url[len(prefix) :]
-    return url

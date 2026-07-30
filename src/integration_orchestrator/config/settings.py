@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_SANDBOX_ROOT = "http://localhost:8000/__sandbox__"
+POSTGRESQL_ASYNC_DRIVER = "asyncpg"
+POSTGRESQL_SYNC_DRIVER = "psycopg"
 
 # Placeholder secrets shipped in .env.example. Their presence in a production
 # environment indicates the deployment never received real credentials.
@@ -65,12 +67,30 @@ class DatabaseSettings(BaseModel):
     statement_timeout_ms: Annotated[int, Field(gt=0)] = 15_000
     echo: bool = False
 
+    @field_validator("url")
+    @classmethod
+    def _use_async_driver(cls, value: str) -> str:
+        """Keep application database access on SQLAlchemy's asyncpg dialect."""
+        return postgresql_url_with_driver(value, driver=POSTGRESQL_ASYNC_DRIVER)
+
     @property
     def sync_url(self) -> str:
         """Driver-synchronous URL, used by Alembic's migration runner."""
-        return self.url.replace("+asyncpg", "+psycopg").replace(
-            "postgresql+psycopg://", "postgresql://"
-        )
+        return postgresql_url_with_driver(self.url, driver=POSTGRESQL_SYNC_DRIVER)
+
+
+def postgresql_url_with_driver(url: str, *, driver: str) -> str:
+    """Select a PostgreSQL driver while preserving the URL payload exactly.
+
+    Only the scheme changes. Credentials (including percent-encoding), host,
+    port, database name and query parameters remain byte-for-byte unchanged.
+    Non-PostgreSQL URLs are returned unchanged so Pydantic can report any
+    downstream configuration error in the usual place.
+    """
+    scheme, separator, payload = url.partition("://")
+    if not separator or scheme.split("+", maxsplit=1)[0] != "postgresql":
+        return url
+    return f"postgresql+{driver}://{payload}"
 
 
 class RedisSettings(BaseModel):

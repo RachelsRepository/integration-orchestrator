@@ -17,17 +17,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
-COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.12.0 /uv /usr/local/bin/uv
 
 WORKDIR /build
 
 # Dependencies are installed before the source is copied, so editing application
 # code does not invalidate the dependency layer.
-COPY pyproject.toml uv.lock README.md ./
+# Hatchling reads both files while building the project metadata.
+COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-editable
 
 
 FROM python:3.12-slim-bookworm AS runtime

@@ -135,7 +135,7 @@ resource "aws_db_instance" "this" {
 
   # Minor versions are patched automatically inside the maintenance window;
   # major versions are not, because they need application verification first.
-  auto_minor_version_upgrade = true
+  auto_minor_version_upgrade  = true
   allow_major_version_upgrade = false
   apply_immediately           = var.apply_immediately
 

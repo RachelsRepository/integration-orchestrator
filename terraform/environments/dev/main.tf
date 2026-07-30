@@ -85,7 +85,7 @@ module "messaging" {
   broker_count               = length(var.availability_zones)
   broker_instance_type       = var.kafka_broker_instance_type
   default_replication_factor = 2
-  min_insync_replicas        = 1
+  min_insync_replicas        = 2
 
   tags = local.tags
 }

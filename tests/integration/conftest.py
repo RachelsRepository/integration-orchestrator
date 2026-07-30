@@ -52,7 +52,7 @@ def database_url() -> Iterator[str]:
     """An async PostgreSQL URL pointing at a usable, empty-schema database."""
     supplied = os.getenv("TEST_DATABASE_URL")
     if supplied:
-        yield _as_async_url(supplied)
+        yield DatabaseSettings(url=supplied).url
         return
 
     container = _start(
@@ -62,7 +62,7 @@ def database_url() -> Iterator[str]:
         SKIP_DATABASE,
     )
     try:
-        yield _as_async_url(container.get_connection_url())
+        yield DatabaseSettings(url=container.get_connection_url()).url
     finally:
         with suppress(Exception):
             container.stop()
@@ -136,18 +136,6 @@ async def redis_client(redis_url: str) -> AsyncIterator[object]:
         yield client
     finally:
         await close_redis(client)
-
-
-def _as_async_url(url: str) -> str:
-    """Normalise any PostgreSQL URL onto the asyncpg driver.
-
-    testcontainers hands back a psycopg2 URL and CI service containers use a
-    bare ``postgresql://``; the application only speaks asyncpg.
-    """
-    for prefix in ("postgresql+psycopg2://", "postgresql+psycopg://", "postgresql://"):
-        if url.startswith(prefix):
-            return "postgresql+asyncpg://" + url[len(prefix) :]
-    return url
 
 
 def _start(factory, skip_reason: str):  # type: ignore[no-untyped-def]
