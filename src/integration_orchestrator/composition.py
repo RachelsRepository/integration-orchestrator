@@ -147,8 +147,20 @@ class Container:
     extras: dict[str, Any] = field(default_factory=dict)
 
     async def startup(self) -> None:
-        """Start the components that hold long-lived connections."""
-        await self.publisher.start()
+        """Start the components that hold long-lived connections.
+
+        Publisher startup is best-effort. A broker outage at boot must not keep
+        the process from binding its HTTP port: liveness would otherwise fail for
+        a problem restarting cannot fix, and orchestrators would thrash the
+        fleet. Readiness continues to report Kafka health honestly.
+        """
+        try:
+            await self.publisher.start()
+        except Exception:
+            logger.exception(
+                "event publisher failed to start; the process will stay up and "
+                "report not-ready until the broker is reachable"
+            )
         logger.info(
             "container started",
             extra={

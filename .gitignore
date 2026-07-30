@@ -29,7 +29,8 @@ coverage.xml
 !.env.example
 *.pem
 !tests/fixtures/keys/*.pem
-secrets/
+# Root-level operator secret material only — not Terraform module paths.
+/secrets/
 
 # Editors and OS
 .idea/

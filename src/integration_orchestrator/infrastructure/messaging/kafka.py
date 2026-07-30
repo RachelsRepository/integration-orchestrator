@@ -15,6 +15,7 @@ not assume it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Sequence
@@ -37,6 +38,14 @@ class KafkaEventPublisher:
         self._producer: AIOKafkaProducer | None = None
 
     async def start(self) -> None:
+        """Connect the producer, bounded by the configured request timeout.
+
+        A missing broker must not block process startup indefinitely. The API's
+        liveness probe only asks whether this process is alive; readiness reports
+        Kafka separately. If bootstrap fails here the publisher stays unstarted
+        and ``healthy()`` returns false until an operator restarts after the
+        broker is reachable.
+        """
         if self._producer is not None:
             return
         producer = AIOKafkaProducer(
@@ -55,7 +64,21 @@ class KafkaEventPublisher:
             # from writing the same record twice.
             enable_idempotence=True,
         )
-        await producer.start()
+        try:
+            async with asyncio.timeout(self._settings.request_timeout_seconds):
+                await producer.start()
+        except (TimeoutError, KafkaError, OSError) as exc:
+            # Best-effort cleanup: start() may have opened sockets before failing.
+            try:
+                await producer.stop()
+            except Exception:
+                logger.debug(
+                    "discarded an error while aborting a failed kafka start",
+                    exc_info=True,
+                )
+            raise EventPublicationError(
+                f"kafka producer failed to start: {type(exc).__name__}"
+            ) from exc
         self._producer = producer
         logger.info(
             "kafka producer started",

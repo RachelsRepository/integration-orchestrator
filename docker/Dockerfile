@@ -8,6 +8,11 @@
 # development dependencies. It runs as a non-root user with a read-only-friendly
 # layout, because a process that never needs to write to its own image should not
 # be able to.
+#
+# Both stages use WORKDIR /app so the virtualenv is created at the same absolute
+# path the runtime stage will use. Console-script shebangs embed that path; a
+# builder that installed into /build/.venv and then copied to /app/.venv would
+# leave every entrypoint pointing at a path that no longer exists.
 
 FROM python:3.12-slim-bookworm AS builder
 
@@ -19,7 +24,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.0 /uv /usr/local/bin/uv
 
-WORKDIR /build
+WORKDIR /app
 
 # Dependencies are installed before the source is copied, so editing application
 # code does not invalidate the dependency layer.
@@ -47,7 +52,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder --chown=orchestrator:orchestrator /build/.venv /app/.venv
+COPY --from=builder --chown=orchestrator:orchestrator /app/.venv /app/.venv
 COPY --chown=orchestrator:orchestrator src /app/src
 COPY --chown=orchestrator:orchestrator migrations /app/migrations
 COPY --chown=orchestrator:orchestrator alembic.ini /app/alembic.ini
@@ -60,8 +65,9 @@ EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
     CMD curl --fail --silent http://localhost:8000/health/live || exit 1
 
-# Single worker per container. Scaling is horizontal, by running more containers,
-# so each one has a predictable connection-pool footprint against PostgreSQL.
-CMD ["uvicorn", "integration_orchestrator.api.app:create_app", \
+# Invoke via ``python -m`` so startup does not depend on a relocatable console
+# script shebang. Single worker per container: scaling is horizontal, so each
+# process has a predictable connection-pool footprint against PostgreSQL.
+CMD ["python", "-m", "uvicorn", "integration_orchestrator.api.app:create_app", \
      "--factory", "--host", "0.0.0.0", "--port", "8000", \
      "--no-access-log", "--proxy-headers"]
