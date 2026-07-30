@@ -8,11 +8,14 @@ failure mode no amount of code review reliably catches.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 from pydantic import SecretStr, ValidationError
 
 from integration_orchestrator.config.settings import (
+    SANDBOX_COBALT_WEBHOOK_PUBLIC_KEY,
     Environment,
     KafkaSettings,
     ProviderSandboxSettings,
@@ -25,6 +28,40 @@ from integration_orchestrator.config.settings import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _configuration_comes_from_the_test(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Build settings from declared defaults rather than the ambient environment.
+
+    These tests assert what ``Settings`` does with a given configuration, so the
+    configuration has to come from the test. CI exports ``ENVIRONMENT=test`` and
+    ``KAFKA__ENABLED=false`` for the integration suite; without this isolation
+    those values become a silent, invisible input to every assertion here — a
+    default-only construction stops being default-only, and the production
+    fixture below stops describing production.
+    """
+    prefixes = tuple(name.upper() for name in Settings.model_fields)
+    nested = tuple(f"{prefix}__" for prefix in prefixes)
+    for name in list(os.environ):
+        upper = name.upper()
+        if upper in prefixes or upper.startswith(nested):
+            monkeypatch.delenv(name, raising=False)
+    # ``env_file`` is resolved relative to the working directory, so a developer's
+    # local .env would otherwise leak in the same way.
+    monkeypatch.chdir(tmp_path)
+
+
+def northstar_in_production() -> ProviderSettings:
+    """A fully configured OAuth2 provider: real endpoints, rotated credentials."""
+    return ProviderSettings(
+        display_name="Northstar Connect",
+        base_url="https://api.northstar.test",
+        oauth_token_url="https://auth.northstar.test/oauth/token",
+        client_id="northstar-issued-client-id",
+        client_secret=SecretStr("rotated-northstar-credential"),
+        webhook_secret=SecretStr("rotated-northstar-webhook"),
+    )
+
+
 def production(**overrides: object) -> Settings:
     """Build a production-shaped configuration that passes every safety rule."""
     base: dict[str, object] = {
@@ -33,12 +70,7 @@ def production(**overrides: object) -> Settings:
         "log_console_renderer": False,
         "jwt": {"secret": SecretStr("a-real-signing-secret-from-the-secrets-manager")},
         "providers": {
-            "northstar": ProviderSettings(
-                display_name="Northstar Connect",
-                base_url="https://api.northstar.test",
-                client_secret=SecretStr("rotated-northstar-credential"),
-                webhook_secret=SecretStr("rotated-northstar-webhook"),
-            ),
+            "northstar": northstar_in_production(),
             "meridian": ProviderSettings(enabled=False),
             "cobalt": ProviderSettings(enabled=False),
         },
@@ -87,16 +119,73 @@ def test_a_provider_still_pointing_at_localhost_stops_production_starting() -> N
         )
 
 
+def test_a_provider_still_using_the_sandbox_token_endpoint_stops_production_starting() -> None:
+    """A real API paired with a sandbox token URL fails on the first call."""
+    with pytest.raises(ValidationError, match="local OAuth2 token URL"):
+        production(
+            providers={
+                "northstar": ProviderSettings(
+                    base_url="https://api.northstar.test",
+                    oauth_token_url="http://localhost:8000/__sandbox__/northstar/oauth/token",
+                    client_id="northstar-issued-client-id",
+                    client_secret=SecretStr("rotated-northstar-credential"),
+                    webhook_secret=SecretStr("rotated-northstar-webhook"),
+                )
+            }
+        )
+
+
+def test_a_provider_without_its_credentials_stops_production_starting() -> None:
+    """Meridian authenticates by API key, so a missing key means every call 401s."""
+    with pytest.raises(ValidationError, match="missing its api_key"):
+        production(
+            providers={
+                "meridian": ProviderSettings(
+                    base_url="https://api.meridian.test",
+                    api_key=None,
+                    webhook_secret=SecretStr("rotated-meridian-webhook"),
+                )
+            }
+        )
+
+
+def test_a_provider_without_webhook_material_stops_production_starting() -> None:
+    """Unverifiable deliveries are rejected, so work would silently never complete."""
+    with pytest.raises(ValidationError, match="webhook verification material"):
+        production(
+            providers={
+                "northstar": ProviderSettings(
+                    base_url="https://api.northstar.test",
+                    oauth_token_url="https://auth.northstar.test/oauth/token",
+                    client_id="northstar-issued-client-id",
+                    client_secret=SecretStr("rotated-northstar-credential"),
+                    webhook_secret=None,
+                )
+            }
+        )
+
+
+def test_the_sandbox_webhook_key_stops_production_starting() -> None:
+    """The sandbox signing key is public; anyone could forge a delivery with it."""
+    with pytest.raises(ValidationError, match="sandbox key"):
+        production(
+            providers={
+                "cobalt": ProviderSettings(
+                    base_url="https://api.cobalt.test",
+                    oauth_token_url="https://auth.cobalt.test/oauth/token",
+                    client_id="cobalt-issued-client-id",
+                    client_secret=SecretStr("rotated-cobalt-credential"),
+                    webhook_public_key=SANDBOX_COBALT_WEBHOOK_PUBLIC_KEY,
+                )
+            }
+        )
+
+
 def test_a_disabled_provider_is_not_held_to_production_rules() -> None:
     """A provider nobody is using should not block a deployment."""
     settings = production(
         providers={
-            "northstar": ProviderSettings(
-                display_name="Northstar Connect",
-                base_url="https://api.northstar.test",
-                client_secret=SecretStr("rotated-northstar-credential"),
-                webhook_secret=SecretStr("rotated-northstar-webhook"),
-            ),
+            "northstar": northstar_in_production(),
             "meridian": ProviderSettings(enabled=False, base_url="http://localhost:8000"),
             "cobalt": ProviderSettings(enabled=False),
         }

@@ -29,6 +29,10 @@ POSTGRESQL_SYNC_DRIVER = "psycopg"
 # environment indicates the deployment never received real credentials.
 _LOCAL_PLACEHOLDER_MARKERS = ("local-", "changeme", "example", "placeholder")
 
+# Hosts that only ever mean "this developer's machine". A provider endpoint
+# still naming one of these in a deployed environment is a leftover default.
+_LOCAL_HOST_MARKERS = ("localhost", "127.0.0.1", "0.0.0.0", "::1")  # noqa: S104
+
 #: Base64 of the sandbox's Ed25519 webhook public key. Duplicated here as a
 #: literal rather than imported, because configuration must not depend on
 #: infrastructure; a test asserts the two never drift apart.
@@ -414,17 +418,10 @@ class Settings(BaseSettings):
             problems.append("JWT__SECRET is still the development placeholder")
 
         for slug, provider in self.providers.items():
-            if not provider.enabled:
-                continue
-            if not provider.base_url or "localhost" in provider.base_url:
-                problems.append(f"provider '{slug}' still points at a local base URL")
-            for label, secret in (
-                ("client_secret", provider.client_secret),
-                ("api_key", provider.api_key),
-                ("webhook_secret", provider.webhook_secret),
-            ):
-                if secret is not None and _looks_like_placeholder(secret.get_secret_value()):
-                    problems.append(f"provider '{slug}' {label} is still a development placeholder")
+            # A provider nobody is calling cannot cause a production incident, so
+            # it is not held to these rules.
+            if provider.enabled:
+                problems.extend(_provider_problems(slug, provider))
 
         if problems:
             joined = "; ".join(problems)
@@ -454,6 +451,76 @@ class Settings(BaseSettings):
         by remembering to add it to a deny-list here.
         """
         return self.model_dump(mode="json")
+
+
+def _provider_problems(slug: str, provider: ProviderSettings) -> list[str]:
+    """Production-safety problems for one enabled provider.
+
+    Split out of the root validator so the provider rules can be read on their
+    own, and so neither function turns into an unreadable decision tree.
+    """
+    return _provider_endpoint_problems(slug, provider) + _provider_credential_problems(
+        slug, provider
+    )
+
+
+def _provider_endpoint_problems(slug: str, provider: ProviderSettings) -> list[str]:
+    """Reject provider endpoints that are still the local sandbox."""
+    problems: list[str] = []
+
+    if not provider.base_url or _is_local_url(provider.base_url):
+        problems.append(f"provider '{slug}' still points at a local base URL")
+
+    if provider.authentication_type is not AuthenticationType.OAUTH2_CLIENT_CREDENTIALS:
+        return problems
+
+    # Checked alongside the base URL because a real API paired with a sandbox
+    # token endpoint fails at the first call, not at deployment.
+    if not provider.oauth_token_url:
+        problems.append(f"provider '{slug}' has no OAuth2 token URL")
+    elif _is_local_url(provider.oauth_token_url):
+        problems.append(f"provider '{slug}' still points at a local OAuth2 token URL")
+
+    return problems
+
+
+def _provider_credential_problems(slug: str, provider: ProviderSettings) -> list[str]:
+    """Reject missing, placeholder or sandbox provider credentials."""
+    problems: list[str] = []
+
+    if provider.authentication_type is AuthenticationType.OAUTH2_CLIENT_CREDENTIALS:
+        if provider.client_id is None or provider.client_secret is None:
+            problems.append(f"provider '{slug}' is missing its OAuth2 client credentials")
+    elif provider.api_key is None:
+        problems.append(f"provider '{slug}' is missing its api_key")
+
+    # Provider work completes by webhook here. An adapter with no verification
+    # material rejects every delivery, so requests would stay in flight until
+    # reconciliation gave up — a silent failure worth catching at startup.
+    if provider.webhook_secret is None and not provider.webhook_public_key:
+        problems.append(f"provider '{slug}' has no webhook verification material")
+    if provider.webhook_public_key == SANDBOX_COBALT_WEBHOOK_PUBLIC_KEY:
+        problems.append(f"provider '{slug}' webhook_public_key is still the sandbox key")
+
+    for label, secret in (
+        ("client_secret", provider.client_secret),
+        ("api_key", provider.api_key),
+        ("webhook_secret", provider.webhook_secret),
+    ):
+        if secret is not None and _looks_like_placeholder(secret.get_secret_value()):
+            problems.append(f"provider '{slug}' {label} is still a development placeholder")
+
+    # ``client_id`` is not a secret, so the SecretStr scan above never sees it,
+    # but a leftover development client id is just as broken.
+    if provider.client_id is not None and _looks_like_placeholder(provider.client_id):
+        problems.append(f"provider '{slug}' client_id is still a development placeholder")
+
+    return problems
+
+
+def _is_local_url(url: str) -> bool:
+    lowered = url.lower()
+    return any(marker in lowered for marker in _LOCAL_HOST_MARKERS)
 
 
 def _looks_like_placeholder(secret: str) -> bool:
