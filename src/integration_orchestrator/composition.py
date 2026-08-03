@@ -36,6 +36,9 @@ from integration_orchestrator.application.ports.messaging import EventPublisher
 from integration_orchestrator.application.services.dispatcher import RequestDispatcher
 from integration_orchestrator.application.services.journal import WorkflowJournal
 from integration_orchestrator.application.services.reconciliation import ReconciliationService
+from integration_orchestrator.application.services.workflow_orchestrator import (
+    WorkflowOrchestrator,
+)
 from integration_orchestrator.application.use_cases.cancel_request import (
     CancelIntegrationRequestUseCase,
 )
@@ -51,6 +54,12 @@ from integration_orchestrator.application.use_cases.queries import (
 )
 from integration_orchestrator.application.use_cases.retry_request import (
     RetryIntegrationRequestUseCase,
+)
+from integration_orchestrator.application.use_cases.start_workflow import (
+    CancelWorkflowUseCase,
+    GetWorkflowUseCase,
+    RegisterWorkflowDefinitionUseCase,
+    StartWorkflowUseCase,
 )
 from integration_orchestrator.config.settings import Environment, Settings, get_settings
 from integration_orchestrator.domain.enums import AuditAction, CircuitState
@@ -74,11 +83,14 @@ from integration_orchestrator.infrastructure.redis.client import (
     close_redis,
     create_redis,
 )
+from integration_orchestrator.infrastructure.redis.inbound_rate_limiter import InboundRateLimiter
 from integration_orchestrator.infrastructure.redis.locks import RedisLockManager
 from integration_orchestrator.infrastructure.redis.rate_limiter import RedisRateLimiter
 from integration_orchestrator.infrastructure.redis.token_cache import RedisTokenCache
+from integration_orchestrator.infrastructure.redis.webhook_replay import RedisWebhookReplayGuard
 from integration_orchestrator.infrastructure.resilience.bulkhead import ProviderBulkhead
 from integration_orchestrator.infrastructure.resilience.policies import ConfiguredPolicyProvider
+from integration_orchestrator.infrastructure.security.token_crypto import derive_fernet
 from integration_orchestrator.infrastructure.security.tokens import TokenVerifier
 from integration_orchestrator.infrastructure.system import RandomJitter, SystemClock, UuidGenerator
 from integration_orchestrator.observability.logging import configure_logging
@@ -112,6 +124,9 @@ class UseCases:
     cancel_request: CancelIntegrationRequestUseCase
     ingest_webhook: IngestWebhookUseCase
     list_providers: ListProvidersUseCase
+    start_workflow: StartWorkflowUseCase
+    get_workflow: GetWorkflowUseCase
+    cancel_workflow: CancelWorkflowUseCase
 
 
 @dataclass(slots=True)
@@ -135,11 +150,13 @@ class Container:
     journal: WorkflowJournal
     dispatcher: RequestDispatcher
     reconciliation: ReconciliationService
+    workflow_orchestrator: WorkflowOrchestrator
     use_cases: UseCases
     metrics: PrometheusMetrics
     token_verifier: TokenVerifier
     circuit_breaker: RedisCircuitBreaker
     rate_limiter: RedisRateLimiter
+    inbound_rate_limiter: InboundRateLimiter
     bulkhead: ProviderBulkhead
     clock: SystemClock
     ids: UuidGenerator
@@ -211,6 +228,11 @@ async def build_container(settings: Settings | None = None) -> Container:
 
     engine = create_engine(settings.database, environment=settings.environment)
     session_factory = create_session_factory(engine)
+    if settings.persistence_driver != "postgres":
+        raise RuntimeError(
+            f"persistence_driver={settings.persistence_driver!r} is not supported at runtime; "
+            "use postgres (memory repositories exist only inside unit tests)"
+        )
     uow_factory = SqlUnitOfWorkFactory(session_factory)
 
     redis = create_redis(settings.redis)
@@ -225,9 +247,17 @@ async def build_container(settings: Settings | None = None) -> Container:
     policies = ConfiguredPolicyProvider(provider_settings)
     circuit_breaker = RedisCircuitBreaker(redis, keys, policies)
     rate_limiter = RedisRateLimiter(redis, keys, provider_settings)
+    inbound_rate_limiter = InboundRateLimiter(redis, keys, metrics)
     bulkhead = ProviderBulkhead(provider_settings, metrics=metrics)
-    token_cache = RedisTokenCache(redis, keys)
+    token_cache = RedisTokenCache(
+        redis,
+        keys,
+        fernet=derive_fernet(settings.token_encryption.secret),
+    )
     locks = RedisLockManager(redis, keys)
+    webhook_replay = RedisWebhookReplayGuard(
+        redis, keys, ttl_seconds=settings.webhooks.signature_dedupe_ttl_seconds
+    )
 
     journal = WorkflowJournal(clock=clock, ids=ids)
 
@@ -284,6 +314,15 @@ async def build_container(settings: Settings | None = None) -> Container:
         metrics=metrics,
     )
 
+    workflow_orchestrator = WorkflowOrchestrator(
+        uow_factory=uow_factory,
+        journal=journal,
+        dispatcher=dispatcher,
+        clock=clock,
+        ids=ids,
+    )
+    dispatcher._on_terminal = workflow_orchestrator.on_request_terminal
+
     reconciliation = ReconciliationService(
         uow_factory=uow_factory,
         registry=registry,
@@ -292,6 +331,10 @@ async def build_container(settings: Settings | None = None) -> Container:
         metrics=metrics,
         stale_after_seconds=settings.workers.reconciliation_stale_after_seconds,
         manual_review_after_seconds=settings.workers.reconciliation_manual_review_after_seconds,
+    )
+
+    register_workflow = RegisterWorkflowDefinitionUseCase(
+        uow_factory=uow_factory, clock=clock, ids=ids
     )
 
     use_cases = UseCases(
@@ -321,6 +364,8 @@ async def build_container(settings: Settings | None = None) -> Container:
             ids=ids,
             metrics=metrics,
             deferred_retry_seconds=settings.workers.webhook_deferred_retry_seconds,
+            replay_guard=webhook_replay,
+            on_request_updated=workflow_orchestrator.on_request_terminal,
         ),
         list_providers=ListProvidersUseCase(
             registry=registry,
@@ -328,6 +373,14 @@ async def build_container(settings: Settings | None = None) -> Container:
             concurrency=bulkhead,
             clock=clock,
         ),
+        start_workflow=StartWorkflowUseCase(
+            uow_factory=uow_factory,
+            orchestrator=workflow_orchestrator,
+            register=register_workflow,
+            clock=clock,
+        ),
+        get_workflow=GetWorkflowUseCase(uow_factory=uow_factory),
+        cancel_workflow=CancelWorkflowUseCase(orchestrator=workflow_orchestrator),
     )
 
     return Container(
@@ -341,11 +394,13 @@ async def build_container(settings: Settings | None = None) -> Container:
         journal=journal,
         dispatcher=dispatcher,
         reconciliation=reconciliation,
+        workflow_orchestrator=workflow_orchestrator,
         use_cases=use_cases,
         metrics=metrics,
         token_verifier=TokenVerifier(settings.jwt),
         circuit_breaker=circuit_breaker,
         rate_limiter=rate_limiter,
+        inbound_rate_limiter=inbound_rate_limiter,
         bulkhead=bulkhead,
         clock=clock,
         ids=ids,

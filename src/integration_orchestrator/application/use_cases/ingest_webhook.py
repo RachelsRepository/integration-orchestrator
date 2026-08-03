@@ -34,6 +34,11 @@ from integration_orchestrator.application.dto.commands import Actor, IngestWebho
 from integration_orchestrator.application.dto.results import WebhookIngestionResult
 from integration_orchestrator.application.ports.observability import MetricsSink
 from integration_orchestrator.application.ports.provider_gateway import ProviderRegistry
+from integration_orchestrator.application.ports.security import (
+    NullWebhookReplayGuard,
+    WebhookReplayGuard,
+    extract_signature_header,
+)
 from integration_orchestrator.application.ports.system import Clock, IdentifierGenerator
 from integration_orchestrator.application.ports.unit_of_work import (
     UnitOfWork,
@@ -90,6 +95,8 @@ class IngestWebhookUseCase:
         ids: IdentifierGenerator,
         metrics: MetricsSink,
         deferred_retry_seconds: float,
+        replay_guard: WebhookReplayGuard | None = None,
+        on_request_updated: Any | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._registry = registry
@@ -98,6 +105,8 @@ class IngestWebhookUseCase:
         self._ids = ids
         self._metrics = metrics
         self._deferred_retry_seconds = deferred_retry_seconds
+        self._replay_guard = replay_guard or NullWebhookReplayGuard()
+        self._on_request_updated = on_request_updated
 
     async def execute(self, command: IngestWebhookCommand) -> WebhookIngestionResult:
         webhook = command.webhook
@@ -116,6 +125,18 @@ class IngestWebhookUseCase:
                 webhook,
                 signature_metadata=verification.signature_metadata,
                 reason=verification.reason or "signature verification failed",
+                correlation_id=command.correlation_id,
+            )
+
+        signature = extract_signature_header(webhook.headers)
+        if signature is not None and not await self._replay_guard.claim(provider, signature):
+            self._metrics.increment(
+                "webhook_signature_replay_total", labels={"provider": provider.value}
+            )
+            return await self._record_rejection(
+                webhook,
+                signature_metadata=verification.signature_metadata,
+                reason="signature replay detected within the dedupe window",
                 correlation_id=command.correlation_id,
             )
 
@@ -374,6 +395,14 @@ class IngestWebhookUseCase:
                 "status": transition.new_status.value,
             },
         )
+        if self._on_request_updated is not None:
+            try:
+                await self._on_request_updated(correlated_id)
+            except Exception:
+                logger.exception(
+                    "workflow webhook hook failed",
+                    extra={"integration_request_id": str(correlated_id)},
+                )
         return WebhookIngestionResult(
             receipt_id=receipt.id,
             status=WebhookProcessingStatus.PROCESSED,

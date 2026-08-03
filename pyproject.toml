@@ -97,14 +97,32 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S105", "S106", "S311", "PLR0915", "ARG001", "ARG002"]
-"scripts/**" = ["T20", "S105", "S106"]
+"tests/**" = ["S105", "S106", "S311", "PLR0915", "ARG001", "ARG002", "PLR1714"]
+"scripts/**" = ["T20", "S105", "S106", "S310", "S603", "S607", "S608", "PLR0912", "PLR0915"]
+"src/integration_orchestrator/config/settings.py" = ["S108"]
+"src/integration_orchestrator/workers/heartbeat.py" = ["S108"]
 "src/integration_orchestrator/cli.py" = ["T20"]
 "src/integration_orchestrator/infrastructure/providers/sandbox/**" = ["S105", "S106"]
 "src/integration_orchestrator/infrastructure/redis/**" = ["S105"]
 "src/integration_orchestrator/application/ports/security.py" = ["S105"]
 "src/integration_orchestrator/api/**" = ["ARG001"]
 "src/integration_orchestrator/observability/metrics.py" = ["ARG002"]
+"src/integration_orchestrator/application/services/workflow_orchestrator.py" = [
+    "PLR0912",
+    "PLR0915",
+    "SIM102",
+    "PLR1714",
+]
+"src/integration_orchestrator/observability/redaction.py" = ["UP038"]
+"src/integration_orchestrator/api/errors.py" = ["UP038"]
+"src/integration_orchestrator/infrastructure/providers/http.py" = ["UP038"]
+"src/integration_orchestrator/infrastructure/providers/sandbox/app.py" = ["UP038"]
+"src/integration_orchestrator/infrastructure/security/tokens.py" = ["UP038"]
+"src/integration_orchestrator/observability/logging.py" = ["UP038"]
+"src/integration_orchestrator/workers/base.py" = ["UP038"]
+"tests/support/memory_uow.py" = ["PLR1714"]
+"tests/unit/test_workflow_orchestrator.py" = ["SLF001"]
+"src/integration_orchestrator/workers/workflow_worker.py" = ["SLF001"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["integration_orchestrator"]
@@ -151,6 +169,7 @@ branch = true
 omit = ["*/migrations/*"]
 
 [tool.coverage.report]
+fail_under = 75
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",

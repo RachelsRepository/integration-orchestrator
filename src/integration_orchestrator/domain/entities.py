@@ -98,6 +98,7 @@ class IntegrationRequest:
     completed_at: datetime | None = None
     manual_review_reason: str | None = None
     version: int = 0
+    owner_subject: str | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.created_at, field_name="created_at")
@@ -119,6 +120,7 @@ class IntegrationRequest:
         correlation_id: CorrelationId,
         now: datetime,
         idempotency_key: IdempotencyKey | None = None,
+        owner_subject: str | None = None,
     ) -> Self:
         """Create a request in the ``received`` state."""
         _require_aware(now, field_name="now")
@@ -133,6 +135,7 @@ class IntegrationRequest:
             updated_at=now,
             status=RequestStatus.RECEIVED,
             idempotency_key=idempotency_key,
+            owner_subject=owner_subject,
         )
 
     # -- transitions --------------------------------------------------------

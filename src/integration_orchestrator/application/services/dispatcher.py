@@ -50,7 +50,11 @@ from integration_orchestrator.domain.enums import (
     NormalizedStatus,
     RequestStatus,
 )
-from integration_orchestrator.domain.errors import NotFoundError, ProviderError
+from integration_orchestrator.domain.errors import (
+    NotFoundError,
+    ProviderError,
+    UnsupportedOperationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +77,7 @@ class RequestDispatcher:
         clock: Clock,
         jitter: JitterSource,
         metrics: MetricsSink,
+        on_terminal: Any | None = None,
     ) -> None:
         self._registry = registry
         self._journal = journal
@@ -81,6 +86,7 @@ class RequestDispatcher:
         self._clock = clock
         self._jitter = jitter
         self._metrics = metrics
+        self._on_terminal = on_terminal
 
     # -- phase 1 ------------------------------------------------------------
 
@@ -136,7 +142,9 @@ class RequestDispatcher:
             await self.claim_for_dispatch(uow, request, actor=actor, causation_id=causation_id)
             await uow.commit()
 
-        return await self.complete_attempt(request, actor=actor, causation_id=causation_id)
+        settled = await self.complete_attempt(request, actor=actor, causation_id=causation_id)
+        await self._notify_terminal(settled)
+        return settled
 
     # -- phases 2 and 3 -----------------------------------------------------
 
@@ -194,6 +202,25 @@ class RequestDispatcher:
             await uow.commit()
             return current
 
+    async def _notify_terminal(self, request: IntegrationRequest) -> None:
+        if self._on_terminal is None:
+            return
+        if request.status not in {
+            RequestStatus.SUCCEEDED,
+            RequestStatus.FAILED,
+            RequestStatus.CANCELLED,
+            RequestStatus.MANUAL_REVIEW,
+            RequestStatus.PENDING,
+        }:
+            return
+        try:
+            await self._on_terminal(request.id)
+        except Exception:
+            logger.exception(
+                "workflow terminal hook failed",
+                extra={"integration_request_id": str(request.id)},
+            )
+
     async def _call_provider(self, request: IntegrationRequest) -> ProviderOperationResult:
         gateway = self._registry.get(request.provider)
         command = CreateProviderOperationCommand(
@@ -211,6 +238,24 @@ class RequestDispatcher:
         )
         try:
             return await gateway.create_operation(command)
+        except UnsupportedOperationError as exc:
+            logger.warning(
+                "provider rejected unsupported operation",
+                extra={
+                    "integration_request_id": str(request.id),
+                    "provider": request.provider.value,
+                    "operation_type": request.operation_type.value,
+                    "error_code": exc.code,
+                },
+            )
+            return ProviderOperationResult.failure(
+                error=ProviderErrorInfo(
+                    code=exc.code,
+                    message=exc.message,
+                    category=exc.category,
+                    retryable=False,
+                )
+            )
         except ProviderError as exc:
             logger.warning(
                 "provider dispatch failed",

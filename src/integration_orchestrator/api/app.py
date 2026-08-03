@@ -19,6 +19,7 @@ from integration_orchestrator.api.middleware import (
     AccessLogMiddleware,
     BodySizeLimitMiddleware,
     CorrelationMiddleware,
+    InboundRateLimitMiddleware,
 )
 from integration_orchestrator.api.routers import health, integration_requests, providers, webhooks
 from integration_orchestrator.application.ports.observability import MetricsSink
@@ -56,6 +57,10 @@ TAGS_METADATA = [
             "Inbound provider callbacks. Authenticated by signature verification "
             "rather than by bearer token."
         ),
+    },
+    {
+        "name": "workflows",
+        "description": "Multi-step durable workflow executions and compensation.",
     },
     {"name": "operations", "description": "Health, readiness and metrics."},
 ]
@@ -109,6 +114,7 @@ def create_app(*, settings: Settings | None = None, container: Container | None 
     # Registration order is reversed at execution time, so correlation is added
     # last here in order to run first at request time.
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.webhooks.max_body_bytes)
+    app.add_middleware(InboundRateLimitMiddleware)
     app.add_middleware(
         AccessLogMiddleware,
         metrics=container.metrics if container else _lazy_metrics(app),
@@ -121,6 +127,9 @@ def create_app(*, settings: Settings | None = None, container: Container | None 
     app.include_router(integration_requests.router)
     app.include_router(providers.router)
     app.include_router(webhooks.router)
+    from integration_orchestrator.api.routers import workflows
+
+    app.include_router(workflows.router)
 
     _mount_sandbox(app, settings)
     return app

@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from integration_orchestrator.domain.enums import ErrorCategory, RequestStatus
+from integration_orchestrator.domain.enums import ErrorCategory
 
 # Categories whose failures are, by default, worth retrying. Individual errors
 # can override this, because a 429 with a permanent quota exhaustion message is
@@ -149,19 +149,22 @@ class InvalidStateTransitionError(DomainError):
 
     def __init__(
         self,
-        current: RequestStatus,
-        requested: RequestStatus,
+        current: Any,
+        requested: Any,
         *,
         aggregate_id: str | None = None,
         correlation_id: str | None = None,
+        message: str | None = None,
     ) -> None:
+        current_value = getattr(current, "value", str(current))
+        requested_value = getattr(requested, "value", str(requested))
         super().__init__(
-            f"cannot transition from '{current.value}' to '{requested.value}'",
+            message or f"cannot transition from '{current_value}' to '{requested_value}'",
             correlation_id=correlation_id,
             retryable=False,
             metadata={
-                "current_status": current.value,
-                "requested_status": requested.value,
+                "current_status": current_value,
+                "requested_status": requested_value,
                 **({"aggregate_id": aggregate_id} if aggregate_id else {}),
             },
         )

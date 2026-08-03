@@ -100,7 +100,7 @@ jobs:
         run: uv run python scripts/check_migrations.py
 
       - name: Run tests
-        run: uv run pytest --cov --cov-report=xml --cov-report=term-missing
+        run: uv run pytest --cov --cov-report=xml --cov-report=term-missing --cov-fail-under=75
 
       - name: Upload coverage
         if: ${{ always() && hashFiles('coverage.xml') != '' }}
@@ -109,6 +109,86 @@ jobs:
           name: coverage
           path: coverage.xml
           if-no-files-found: ignore
+
+  supply-chain:
+    name: Dependency and container scans
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Generate SBOM from lockfile
+        run: |
+          uv sync --frozen --extra dev
+          uv export --frozen --no-hashes --no-dev -o requirements-prod.txt
+          python - <<'PY'
+          import json, hashlib, pathlib
+          lines = [ln.strip() for ln in pathlib.Path("requirements-prod.txt").read_text().splitlines()
+                   if ln.strip() and not ln.startswith("#") and not ln.startswith("-")]
+          components = []
+          for line in lines:
+              name = line.split("==")[0].split("[")[0]
+              version = line.split("==")[1] if "==" in line else "unknown"
+              components.append({
+                  "type": "library",
+                  "name": name,
+                  "version": version,
+                  "bom-ref": f"pkg:pypi/{name}@{version}",
+              })
+          bom = {
+              "bomFormat": "CycloneDX",
+              "specVersion": "1.5",
+              "version": 1,
+              "metadata": {"component": {"type": "application", "name": "integration-orchestrator"}},
+              "components": components,
+          }
+          pathlib.Path("sbom.cdx.json").write_text(json.dumps(bom, indent=2))
+          print(f"wrote sbom with {len(components)} components")
+          PY
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v6
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          if-no-files-found: ignore
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: integration-orchestrator:scan
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: integration-orchestrator:scan
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+        continue-on-error: true
 
   container:
     name: Container build
@@ -151,6 +231,85 @@ jobs:
           docker logs orchestrator-ci
           docker stop orchestrator-ci
           exit 1
+
+  runtime:
+    name: Compose runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Start the Compose stack
+        run: |
+          cp -n .env.example .env || true
+          docker compose up --build -d
+          docker compose ps
+
+      - name: Wait for readiness and run Compose e2e
+        run: |
+          export ORCHESTRATOR_BASE_URL=http://localhost:18100
+          export ORCHESTRATOR_API_A=http://localhost:18100
+          export ORCHESTRATOR_API_B=http://localhost:18101
+          export JWT__SECRET=local-development-signing-secret-not-for-production
+          export ENVIRONMENT=local
+          # Two clean cycles: empty volumes → probes → down -v → up → probes again.
+          for cycle in 1 2; do
+            echo "=== compose e2e cycle ${cycle} ==="
+            # Wait for both API replicas.
+            for url in http://localhost:18100 http://localhost:18101; do
+              for attempt in $(seq 1 60); do
+                if curl --fail --silent "${url}/health/ready" | grep -q ready; then
+                  break
+                fi
+                sleep 2
+              done
+            done
+            uv run python scripts/compose_e2e.py
+            uv run python scripts/dual_api_rate_limit.py
+            uv run python scripts/recon_matrix.py
+            if [ "${cycle}" = "1" ]; then
+              docker compose down -v --remove-orphans
+              docker compose up --build -d
+            fi
+          done
+
+      - name: Chaos recovery suite
+        run: |
+          export ORCHESTRATOR_BASE_URL=http://localhost:18100
+          export ORCHESTRATOR_API_A=http://localhost:18100
+          export ORCHESTRATOR_API_B=http://localhost:18101
+          export JWT__SECRET=local-development-signing-secret-not-for-production
+          export ENVIRONMENT=local
+          uv run python scripts/chaos_subset.py
+          # Runtime parity: dual API, shared RL, fan-out/fan-in, cancel, deadline,
+          # reconciliation matrix, expanded chaos (worker/API/Redis/provider/stack).
+
+      - name: Capture logs on failure
+        if: failure()
+        run: |
+          docker compose ps || true
+          docker compose logs --no-color > compose-runtime-logs.txt || true
+
+      - name: Upload Compose logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: compose-runtime-logs
+          path: compose-runtime-logs.txt
+          if-no-files-found: ignore
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans
 
   terraform:
     name: Terraform

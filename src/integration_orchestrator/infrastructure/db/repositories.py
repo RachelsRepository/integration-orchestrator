@@ -291,11 +291,14 @@ class SqlOutboxRepository:
     async def add_many(self, events: Sequence[OutboxEvent]) -> None:
         self._session.add_all([mappers.outbox_to_row(event) for event in events])
 
-    async def claim_unpublished(self, *, now: datetime, limit: int) -> Sequence[OutboxEvent]:
+    async def claim_unpublished(
+        self, *, now: datetime, limit: int, lease_until: datetime
+    ) -> Sequence[OutboxEvent]:
         result = await self._session.execute(
             select(OutboxEventModel)
             .where(
                 OutboxEventModel.published_at.is_(None),
+                OutboxEventModel.dead_lettered_at.is_(None),
                 or_(
                     OutboxEventModel.next_attempt_at.is_(None),
                     OutboxEventModel.next_attempt_at <= now,
@@ -308,7 +311,21 @@ class SqlOutboxRepository:
             .limit(limit)
             .with_for_update(skip_locked=True)
         )
-        return [mappers.outbox_to_domain(row) for row in result.scalars().all()]
+        rows = list(result.scalars().all())
+        if not rows:
+            return []
+        # Push next_attempt_at into the future so another publisher that polls
+        # after this transaction commits cannot reclaim the same rows while we
+        # are still talking to the broker.
+        await self._session.execute(
+            update(OutboxEventModel)
+            .where(OutboxEventModel.id.in_([row.id for row in rows]))
+            .values(next_attempt_at=lease_until)
+        )
+        events = [mappers.outbox_to_domain(row) for row in rows]
+        for event in events:
+            event.next_attempt_at = lease_until
+        return events
 
     async def mark_published(self, outbox_ids: Sequence[UUID], *, now: datetime) -> None:
         if not outbox_ids:
@@ -333,13 +350,54 @@ class SqlOutboxRepository:
             )
         )
 
+    async def mark_dead_lettered(self, outbox_id: UUID, *, error: str, now: datetime) -> None:
+        await self._session.execute(
+            update(OutboxEventModel)
+            .where(OutboxEventModel.id == outbox_id)
+            .values(
+                attempt_count=OutboxEventModel.attempt_count + 1,
+                last_error=error[:1000],
+                next_attempt_at=None,
+                dead_lettered_at=now,
+            )
+        )
+
     async def count_pending(self) -> int:
         result = await self._session.execute(
             select(func.count())
             .select_from(OutboxEventModel)
-            .where(OutboxEventModel.published_at.is_(None))
+            .where(
+                OutboxEventModel.published_at.is_(None),
+                OutboxEventModel.dead_lettered_at.is_(None),
+            )
         )
         return int(result.scalar_one())
+
+    async def count_dead_lettered(self) -> int:
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(OutboxEventModel)
+            .where(OutboxEventModel.dead_lettered_at.is_not(None))
+        )
+        return int(result.scalar_one())
+
+    async def redrive_dead_lettered(self, outbox_ids: Sequence[UUID], *, now: datetime) -> int:
+        if not outbox_ids:
+            return 0
+        result = await self._session.execute(
+            update(OutboxEventModel)
+            .where(
+                OutboxEventModel.id.in_(list(outbox_ids)),
+                OutboxEventModel.dead_lettered_at.is_not(None),
+                OutboxEventModel.published_at.is_(None),
+            )
+            .values(
+                dead_lettered_at=None,
+                next_attempt_at=now,
+                last_error=None,
+            )
+        )
+        return _rowcount(result)
 
     async def purge_published_before(self, cutoff: datetime) -> int:
         """Delete published events older than ``cutoff``.
@@ -382,14 +440,19 @@ def _rowcount(result: object) -> int:
     return int(getattr(result, "rowcount", 0) or 0)
 
 
-def translate_integrity_error(error: IntegrityError) -> ConflictError:
-    """Turn a database constraint violation into a domain conflict.
+def translate_integrity_error(error: IntegrityError) -> ConflictError | IntegrityError:
+    """Turn a unique-constraint violation into a domain conflict.
 
     Unique-constraint violations are how the platform arbitrates races, so they
-    are an expected control-flow signal rather than an internal error. Mapping
-    them here keeps SQLAlchemy exception types out of the application layer.
+    are an expected control-flow signal rather than an internal error. Foreign
+    key and check violations are programming bugs and must not be silently
+    converted into "retry the race" — that masked a real flush-ordering bug for
+    idempotency inserts.
     """
     detail = str(getattr(error, "orig", error))
+    lowered = detail.lower()
+    if "unique" not in lowered and "duplicate key" not in lowered:
+        return error
     constraint = _constraint_name(detail)
     return ConflictError(
         "the operation conflicts with an existing record",

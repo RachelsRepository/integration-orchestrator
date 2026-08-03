@@ -38,7 +38,22 @@ Import boundaries are enforced by `import-linter` and by
    and calls the provider through the resilience decorator.
 5. The resulting status transition, audit event, and outbox event are committed
    together.
-6. The outbox publisher later emits the Kafka event outside that transaction.
+
+### Multi-step workflow
+
+1. `POST /api/v1/workflows/executions` starts a versioned definition (for example
+   `customer_onboarding` v1: Northstar → Meridian → Cobalt).
+2. Each step materialises one `IntegrationRequest` (the durable provider effect).
+3. Dependency-satisfied steps become `READY`; workers claim and execute them.
+4. Cobalt (and similar async providers) leave a step in `WAITING` until a signed
+   webhook resumes it.
+5. On mid-graph failure, succeeded steps compensate in reverse completion order.
+6. Failed compensation routes the execution to `MANUAL_REVIEW` without erasing
+   original provider evidence.
+
+Single-request `IntegrationRequest` APIs remain the compatibility path and the
+unit of provider side-effect. Outbox events are committed with domain state;
+the publisher later emits to Kafka outside that transaction.
 
 ### Webhook
 

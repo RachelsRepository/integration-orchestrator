@@ -41,9 +41,17 @@ class Scope:
     REQUESTS_RETRY = "requests:retry"
     REQUESTS_CANCEL = "requests:cancel"
     PROVIDERS_READ = "providers:read"
+    OPERATIONS_ADMIN = "operations:admin"
 
     ALL: frozenset[str] = frozenset(
-        {REQUESTS_READ, REQUESTS_WRITE, REQUESTS_RETRY, REQUESTS_CANCEL, PROVIDERS_READ}
+        {
+            REQUESTS_READ,
+            REQUESTS_WRITE,
+            REQUESTS_RETRY,
+            REQUESTS_CANCEL,
+            PROVIDERS_READ,
+            OPERATIONS_ADMIN,
+        }
     )
 
 

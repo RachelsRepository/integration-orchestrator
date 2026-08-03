@@ -24,14 +24,16 @@ from collections.abc import Sequence
 from integration_orchestrator.composition import Container, build_container
 from integration_orchestrator.config.settings import get_settings
 from integration_orchestrator.workers.base import Worker
+from integration_orchestrator.workers.heartbeat import WorkerHeartbeat
 from integration_orchestrator.workers.outbox_publisher import OutboxPublisherWorker
 from integration_orchestrator.workers.reconciliation_worker import ReconciliationWorker
 from integration_orchestrator.workers.retry_worker import RetryWorker
 from integration_orchestrator.workers.webhook_processor import WebhookProcessorWorker
+from integration_orchestrator.workers.workflow_worker import WorkflowWorker
 
 logger = logging.getLogger(__name__)
 
-WORKER_NAMES = ("outbox", "retry", "webhooks", "reconciliation")
+WORKER_NAMES = ("outbox", "retry", "webhooks", "reconciliation", "workflow")
 
 
 def build_workers(container: Container, *, only: Sequence[str] | None = None) -> list[Worker]:
@@ -65,6 +67,12 @@ def build_workers(container: Container, *, only: Sequence[str] | None = None) ->
             metrics=container.metrics,
             settings=settings,
         ),
+        "workflow": WorkflowWorker(
+            uow_factory=container.uow_factory,
+            orchestrator=container.workflow_orchestrator,
+            metrics=container.metrics,
+            settings=settings,
+        ),
     }
 
     selected = list(only) if only else list(WORKER_NAMES)
@@ -87,6 +95,7 @@ class WorkerRunner:
     async def run(self) -> None:
         await self._container.startup()
         self._install_signal_handlers()
+        heartbeat = WorkerHeartbeat(self._container.settings.workers)
 
         logger.info(
             "worker process started",
@@ -95,12 +104,15 @@ class WorkerRunner:
         self._tasks = [
             asyncio.create_task(worker.run(), name=worker.name) for worker in self._workers
         ]
+        self._tasks.append(asyncio.create_task(heartbeat.run(), name="heartbeat"))
         try:
             # A worker loop only returns when it is stopped, so a task finishing
             # early means something is wrong and the whole process should come
             # down rather than silently run degraded.
             done, _ = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
+                if task.get_name() == "heartbeat":
+                    continue
                 exc = task.exception()
                 if exc is not None:
                     logger.error(
@@ -110,6 +122,7 @@ class WorkerRunner:
         except asyncio.CancelledError:
             logger.info("worker process cancelled")
         finally:
+            heartbeat.stop()
             await self.shutdown()
 
     async def shutdown(self) -> None:

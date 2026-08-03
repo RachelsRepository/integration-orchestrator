@@ -9,9 +9,10 @@ make up
 make migrate
 ```
 
-`docker-compose.yml` runs PostgreSQL, Redis, Kafka (KRaft), the API, and the
-worker process. The provider sandbox is mounted inside the API process in local
-mode.
+`docker-compose.yml` runs PostgreSQL, Redis, a Kafka-protocol broker (Redpanda),
+the API, and the worker process. Host ports default to API `18100`, Postgres
+`15433`, Redis `16380`, and Kafka `29092` to avoid collisions with other local
+stacks. The provider sandbox is mounted inside the API process in local mode.
 
 ## Container image
 
@@ -37,6 +38,8 @@ docker run ... integration-orchestrator worker --only outbox retry
 4. Unit, contract, and e2e tests
 5. Integration tests against PostgreSQL and Redis service containers
 6. A migration drift check
+7. A Compose **runtime** job: build/start the stack, run `scripts/compose_e2e.py`
+   twice on clean volumes, run `scripts/chaos_subset.py`, capture logs on failure
 
 ## Illustrative Terraform
 

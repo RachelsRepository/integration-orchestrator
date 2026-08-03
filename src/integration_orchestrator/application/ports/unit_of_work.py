@@ -18,6 +18,10 @@ from integration_orchestrator.application.ports.repositories import (
     OutboxRepository,
     WebhookReceiptRepository,
 )
+from integration_orchestrator.application.ports.workflow_repositories import (
+    WorkflowDefinitionRepository,
+    WorkflowExecutionRepository,
+)
 
 
 @runtime_checkable
@@ -43,6 +47,12 @@ class UnitOfWork(Protocol):
 
     @property
     def idempotency(self) -> IdempotencyRepository: ...
+
+    @property
+    def workflow_definitions(self) -> WorkflowDefinitionRepository: ...
+
+    @property
+    def workflow_executions(self) -> WorkflowExecutionRepository: ...
 
     async def __aenter__(self) -> UnitOfWork: ...
 

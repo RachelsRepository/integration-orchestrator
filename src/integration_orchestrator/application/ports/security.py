@@ -1,12 +1,20 @@
-"""Ports for credential handling."""
+"""Ports for credential handling and webhook replay protection."""
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from integration_orchestrator.domain.value_objects import ProviderSlug
+
+#: Header names used by the fictional providers. A real onboarding adds its own.
+_SIGNATURE_HEADERS = (
+    "x-northstar-signature",
+    "x-meridian-signature",
+    "x-cobalt-signature",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,3 +63,40 @@ class TokenCache(Protocol):
         happens after a credential rotation or a provider-side revocation.
         """
         ...
+
+
+@runtime_checkable
+class WebhookReplayGuard(Protocol):
+    """Claims a signature digest so the same bytes cannot be accepted twice."""
+
+    async def claim(self, provider: ProviderSlug, signature: str) -> bool:
+        """Return True when this is the first sighting within the TTL window."""
+        ...
+
+
+class NullWebhookReplayGuard:
+    """No-op guard for tests that do not exercise Redis replay protection."""
+
+    async def claim(self, provider: ProviderSlug, signature: str) -> bool:
+        del provider, signature
+        return True
+
+
+def extract_signature_header(headers: dict[str, str]) -> str | None:
+    """Return the first known provider signature header, if present."""
+    lowered = {key.lower(): value for key, value in headers.items()}
+    for name in _SIGNATURE_HEADERS:
+        value = lowered.get(name)
+        if value:
+            return value
+    return None
+
+
+def signature_replay_digest(signature: str) -> str:
+    """Return a short digest of a signature, safe to use as a replay cache key.
+
+    The signature itself is never stored: a stored signature is a reusable
+    credential for any system trusting the same secret. A hash is enough to
+    recognise a repeat.
+    """
+    return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:32]

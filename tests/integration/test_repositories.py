@@ -53,12 +53,12 @@ async def test_two_requests_cannot_share_an_idempotency_key(
 ) -> None:
     """The uniqueness that makes idempotency safe is the database's job."""
     async with uow_factory() as uow:
-        await uow.requests.add(make_request(idempotency_key="key-1"))
+        await uow.requests.add(make_request(idempotency_key="key-1-unique"))
         await uow.commit()
 
     with pytest.raises(ConflictError):
         async with uow_factory() as uow:
-            await uow.requests.add(make_request(idempotency_key="key-1"))
+            await uow.requests.add(make_request(idempotency_key="key-1-unique"))
             await uow.commit()
 
 
@@ -272,8 +272,12 @@ async def test_two_publishers_never_claim_the_same_outbox_event(
     first = uow_factory()
     second = uow_factory()
     async with first, second:
-        batch_one = await first.outbox.claim_unpublished(now=NOW, limit=3)
-        batch_two = await second.outbox.claim_unpublished(now=NOW, limit=3)
+        batch_one = await first.outbox.claim_unpublished(
+            now=NOW, limit=3, lease_until=NOW + timedelta(seconds=60)
+        )
+        batch_two = await second.outbox.claim_unpublished(
+            now=NOW, limit=3, lease_until=NOW + timedelta(seconds=60)
+        )
         ids_one = {event.id for event in batch_one}
         ids_two = {event.id for event in batch_two}
 
@@ -294,7 +298,12 @@ async def test_a_published_event_is_not_claimed_again(
         await uow.commit()
 
     async with uow_factory() as uow:
-        assert await uow.outbox.claim_unpublished(now=NOW, limit=10) == []
+        assert (
+            await uow.outbox.claim_unpublished(
+                now=NOW, limit=10, lease_until=NOW + timedelta(seconds=60)
+            )
+            == []
+        )
         assert await uow.outbox.count_pending() == 0
 
 
@@ -316,8 +325,17 @@ async def test_a_failed_publication_backs_off_before_being_retried(
         await uow.commit()
 
     async with uow_factory() as uow:
-        assert await uow.outbox.claim_unpublished(now=NOW, limit=10) == []
-        later = await uow.outbox.claim_unpublished(now=NOW + timedelta(minutes=1), limit=10)
+        assert (
+            await uow.outbox.claim_unpublished(
+                now=NOW, limit=10, lease_until=NOW + timedelta(seconds=60)
+            )
+            == []
+        )
+        later = await uow.outbox.claim_unpublished(
+            now=NOW + timedelta(minutes=1),
+            limit=10,
+            lease_until=NOW + timedelta(minutes=2),
+        )
 
     assert [claimed.id for claimed in later] == [event.id]
     assert later[0].attempt_count == 1

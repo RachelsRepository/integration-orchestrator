@@ -55,6 +55,21 @@ def build_parser() -> argparse.ArgumentParser:
     token.add_argument("--roles", nargs="+", default=["operator"])
     token.add_argument("--ttl", type=int, default=None, help="Lifetime in seconds.")
 
+    redrive = subcommands.add_parser(
+        "outbox-redrive",
+        help="Re-arm dead-lettered outbox events for another publication attempt.",
+    )
+    redrive.add_argument(
+        "outbox_ids",
+        nargs="+",
+        help="Outbox row UUIDs to redrive (not domain event_ids).",
+    )
+
+    subcommands.add_parser(
+        "reconcile-once",
+        help="Run one reconciliation worker pass (Compose/CI probes).",
+    )
+
     subcommands.add_parser("config", help="Print the effective configuration with secrets masked.")
 
     return parser
@@ -77,6 +92,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _worker(args.only)
     if args.command == "token":
         return _token(settings, subject=args.subject, roles=args.roles, ttl=args.ttl)
+    if args.command == "outbox-redrive":
+        return _outbox_redrive(args.outbox_ids)
+    if args.command == "reconcile-once":
+        return _reconcile_once()
     return _config(settings)
 
 
@@ -129,6 +148,59 @@ def _token(settings: Settings, *, subject: str, roles: Sequence[str], ttl: int |
 
     print(issue_local_token(settings.jwt, subject=subject, roles=list(roles), ttl_seconds=ttl))
     return 0
+
+
+def _outbox_redrive(outbox_ids: Sequence[str]) -> int:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from integration_orchestrator.composition import build_container
+
+    async def _run() -> int:
+        ids = [UUID(value) for value in outbox_ids]
+        container = await build_container()
+        try:
+            async with container.uow_factory() as uow:
+                count = await uow.outbox.redrive_dead_lettered(ids, now=datetime.now(tz=UTC))
+                await uow.commit()
+            print(json.dumps({"redriven": count, "requested": len(ids)}))
+            return 0
+        finally:
+            await container.shutdown()
+
+    try:
+        return asyncio.run(_run())
+    except ValueError as exc:
+        print(f"invalid outbox id: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # pragma: no cover - operator tooling
+        print(f"outbox redrive failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def _reconcile_once() -> int:
+    from integration_orchestrator.composition import build_container
+    from integration_orchestrator.workers.reconciliation_worker import ReconciliationWorker
+
+    async def _run() -> int:
+        container = await build_container()
+        try:
+            worker = ReconciliationWorker(
+                reconciliation=container.reconciliation,
+                metrics=container.metrics,
+                settings=container.settings.workers,
+            )
+            processed = await worker.run_once()
+            print(json.dumps({"reconciled": processed}))
+            return 0
+        finally:
+            await container.shutdown()
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:  # pragma: no cover - operator tooling
+        print(f"reconcile-once failed: {exc}", file=sys.stderr)
+        return 1
 
 
 def _config(settings: Settings) -> int:

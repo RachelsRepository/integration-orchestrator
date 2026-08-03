@@ -1,0 +1,48 @@
+# Example Prometheus alert rules for the Integration Orchestrator.
+# Wire these into your Prometheus / Alertmanager / Grafana stack.
+# Thresholds are starting points — tune against your baseline load harness.
+
+groups:
+  - name: integration-orchestrator
+    rules:
+      - alert: OutboxBacklogHigh
+        expr: outbox_pending_total > 500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Outbox backlog is elevated
+          description: "{{ $value }} unpublished outbox events for >10m."
+
+      - alert: OutboxDeadLetterPresent
+        expr: outbox_dead_lettered_total > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Outbox dead-letter queue is non-empty
+          description: Use `integration-orchestrator outbox-redrive` after investigation.
+
+      - alert: ProviderCircuitOpen
+        expr: provider_circuit_state == 2
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Provider circuit is open
+          description: Provider {{ $labels.provider }} circuit state is open.
+
+      - alert: ReconciliationMismatches
+        expr: increase(reconciliation_mismatches_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Reconciliation found mismatches
+          description: Investigate kind={{ $labels.kind }} provider={{ $labels.provider }}.
+
+      - alert: InboundRateLimitSpike
+        expr: increase(inbound_rate_limit_total{outcome="rejected"}[5m]) > 100
+        labels:
+          severity: warning
+        annotations:
+          summary: Elevated inbound rate-limit rejections

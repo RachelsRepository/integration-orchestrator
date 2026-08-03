@@ -36,6 +36,7 @@ from integration_orchestrator.domain.errors import ConcurrencyConflictError, Con
 from integration_orchestrator.domain.records import AuditEvent, IdempotencyRecord, OutboxEvent
 from integration_orchestrator.domain.state_machine import RECONCILABLE_STATUSES
 from integration_orchestrator.domain.value_objects import ProviderSlug
+from integration_orchestrator.domain.workflow import WorkflowDefinition, WorkflowExecution
 
 
 class MemoryStore:
@@ -47,6 +48,8 @@ class MemoryStore:
         self.audit: list[AuditEvent] = []
         self.outbox: dict[UUID, OutboxEvent] = {}
         self.idempotency: dict[str, IdempotencyRecord] = {}
+        self.workflow_definitions: dict[UUID, WorkflowDefinition] = {}
+        self.workflow_executions: dict[UUID, WorkflowExecution] = {}
         self.commits = 0
         self.rollbacks = 0
 
@@ -64,7 +67,11 @@ class MemoryStore:
         return [event.event_type for event in self.outbox.values()]
 
     def unpublished(self) -> list[OutboxEvent]:
-        return [event for event in self.outbox.values() if event.published_at is None]
+        return [
+            event
+            for event in self.outbox.values()
+            if event.published_at is None and event.dead_lettered_at is None
+        ]
 
 
 class _Staged:
@@ -74,6 +81,8 @@ class _Staged:
         self.audit: list[AuditEvent] = []
         self.outbox: dict[UUID, OutboxEvent] = {}
         self.idempotency: dict[str, IdempotencyRecord] = {}
+        self.workflow_definitions: dict[UUID, WorkflowDefinition] = {}
+        self.workflow_executions: dict[UUID, WorkflowExecution] = {}
         self.outbox_updates: list[tuple[UUID, dict[str, object]]] = []
 
     @property
@@ -84,6 +93,8 @@ class _Staged:
             or self.audit
             or self.outbox
             or self.idempotency
+            or self.workflow_definitions
+            or self.workflow_executions
             or self.outbox_updates
         )
 
@@ -274,15 +285,24 @@ class MemoryOutboxRepository:
         for event in events:
             self._staged.outbox[event.id] = copy.deepcopy(event)
 
-    async def claim_unpublished(self, *, now: datetime, limit: int) -> Sequence[OutboxEvent]:
+    async def claim_unpublished(
+        self, *, now: datetime, limit: int, lease_until: datetime
+    ) -> Sequence[OutboxEvent]:
         rows = [
             event
             for event in self._visible().values()
             if event.published_at is None
+            and event.dead_lettered_at is None
             and (event.next_attempt_at is None or event.next_attempt_at <= now)
         ]
         rows.sort(key=lambda event: event.created_at)
-        return [copy.deepcopy(event) for event in rows[:limit]]
+        claimed = rows[:limit]
+        for event in claimed:
+            self._staged.outbox_updates.append((event.id, {"next_attempt_at": lease_until}))
+        copies = [copy.deepcopy(event) for event in claimed]
+        for event in copies:
+            event.next_attempt_at = lease_until
+        return copies
 
     async def mark_published(self, outbox_ids: Sequence[UUID], *, now: datetime) -> None:
         for outbox_id in outbox_ids:
@@ -305,8 +325,53 @@ class MemoryOutboxRepository:
             )
         )
 
+    async def mark_dead_lettered(self, outbox_id: UUID, *, error: str, now: datetime) -> None:
+        self._staged.outbox_updates.append(
+            (
+                outbox_id,
+                {
+                    "attempt_count_increment": 1,
+                    "last_error": error[:1000],
+                    "next_attempt_at": None,
+                    "dead_lettered_at": now,
+                },
+            )
+        )
+
     async def count_pending(self) -> int:
-        return sum(1 for event in self._visible().values() if event.published_at is None)
+        return sum(
+            1
+            for event in self._visible().values()
+            if event.published_at is None and event.dead_lettered_at is None
+        )
+
+    async def count_dead_lettered(self) -> int:
+        return sum(1 for event in self._visible().values() if event.dead_lettered_at is not None)
+
+    async def redrive_dead_lettered(self, outbox_ids: Sequence[UUID], *, now: datetime) -> int:
+        count = 0
+        for outbox_id in outbox_ids:
+            event = self._visible().get(outbox_id)
+            if event is None or event.dead_lettered_at is None or event.published_at is not None:
+                continue
+            redriven = copy.deepcopy(event)
+            redriven.dead_lettered_at = None
+            redriven.next_attempt_at = now
+            redriven.last_error = None
+            self._staged.outbox[outbox_id] = redriven
+            count += 1
+        return count
+
+    async def purge_published_before(self, cutoff: datetime) -> int:
+        to_delete = [
+            event_id
+            for event_id, event in self._visible().items()
+            if event.published_at is not None and event.published_at < cutoff
+        ]
+        for event_id in to_delete:
+            self._store.outbox.pop(event_id, None)
+            self._staged.outbox.pop(event_id, None)
+        return len(to_delete)
 
     def _visible(self) -> dict[UUID, OutboxEvent]:
         return {**self._store.outbox, **self._staged.outbox}
@@ -325,6 +390,101 @@ class MemoryIdempotencyRepository:
         self._staged.idempotency[record.key] = record
 
 
+class MemoryWorkflowDefinitionRepository:
+    def __init__(self, store: MemoryStore, staged: _Staged) -> None:
+        self._store = store
+        self._staged = staged
+
+    async def add(self, definition: WorkflowDefinition) -> None:
+        self._staged.workflow_definitions[definition.id] = copy.deepcopy(definition)
+
+    async def get(self, definition_id: UUID) -> WorkflowDefinition | None:
+        item = self._staged.workflow_definitions.get(
+            definition_id
+        ) or self._store.workflow_definitions.get(definition_id)
+        return copy.deepcopy(item) if item else None
+
+    async def get_by_name_version(self, name: str, version: int) -> WorkflowDefinition | None:
+        for source in (self._staged.workflow_definitions, self._store.workflow_definitions):
+            for item in source.values():
+                if item.name == name and item.version == version:
+                    return copy.deepcopy(item)
+        return None
+
+    async def mark_immutable(self, definition: WorkflowDefinition) -> None:
+        current = await self.get(definition.id)
+        if current is None:
+            raise ConflictError("workflow definition not found")
+        self._staged.workflow_definitions[definition.id] = current.mark_immutable()
+
+
+class MemoryWorkflowExecutionRepository:
+    def __init__(self, store: MemoryStore, staged: _Staged) -> None:
+        self._store = store
+        self._staged = staged
+
+    async def add(self, execution: WorkflowExecution) -> None:
+        self._staged.workflow_executions[execution.id] = copy.deepcopy(execution)
+
+    async def get(self, execution_id: UUID) -> WorkflowExecution | None:
+        item = self._staged.workflow_executions.get(
+            execution_id
+        ) or self._store.workflow_executions.get(execution_id)
+        return copy.deepcopy(item) if item else None
+
+    async def get_for_update(self, execution_id: UUID) -> WorkflowExecution | None:
+        return await self.get(execution_id)
+
+    async def get_by_idempotency_key(self, key: str) -> WorkflowExecution | None:
+        for source in (self._staged.workflow_executions, self._store.workflow_executions):
+            for item in source.values():
+                if item.idempotency_key == key:
+                    return copy.deepcopy(item)
+        return None
+
+    async def update(self, execution: WorkflowExecution) -> None:
+        self._staged.workflow_executions[execution.id] = copy.deepcopy(execution)
+
+    async def claim_runnable(
+        self, *, limit: int, now: datetime, lease_until: datetime
+    ) -> Sequence[WorkflowExecution]:
+        from integration_orchestrator.domain.enums import WorkflowStatus
+
+        runnable = {
+            WorkflowStatus.QUEUED,
+            WorkflowStatus.RUNNING,
+            WorkflowStatus.WAITING,
+            WorkflowStatus.COMPENSATING,
+            WorkflowStatus.RETRY_SCHEDULED,
+            WorkflowStatus.TIMED_OUT,
+        }
+        items: list[WorkflowExecution] = []
+        for item in self._store.workflow_executions.values():
+            if item.status not in runnable:
+                continue
+            if item.claim_lease_until is not None and item.claim_lease_until > now:
+                continue
+            claimed = copy.deepcopy(item)
+            claimed.claim_lease_until = lease_until
+            claimed.updated_at = now
+            self._staged.workflow_executions[claimed.id] = claimed
+            items.append(copy.deepcopy(claimed))
+            if len(items) >= limit:
+                break
+        return items
+
+    async def find_by_request_id(self, request_id: UUID) -> WorkflowExecution | None:
+        for source in (self._staged.workflow_executions, self._store.workflow_executions):
+            for item in source.values():
+                for step in item.steps:
+                    if (
+                        step.integration_request_id == request_id
+                        or step.compensation_request_id == request_id
+                    ):
+                        return copy.deepcopy(item)
+        return None
+
+
 class MemoryUnitOfWork:
     """One in-memory transaction."""
 
@@ -339,6 +499,8 @@ class MemoryUnitOfWork:
         self.audit = MemoryAuditRepository(store, self._staged)
         self.outbox = MemoryOutboxRepository(store, self._staged)
         self.idempotency = MemoryIdempotencyRepository(store, self._staged)
+        self.workflow_definitions = MemoryWorkflowDefinitionRepository(store, self._staged)
+        self.workflow_executions = MemoryWorkflowExecutionRepository(store, self._staged)
 
     async def __aenter__(self) -> MemoryUnitOfWork:
         return self
@@ -382,6 +544,8 @@ class MemoryUnitOfWork:
         self._store.audit.extend(self._staged.audit)
         self._store.outbox.update(self._staged.outbox)
         self._store.idempotency.update(self._staged.idempotency)
+        self._store.workflow_definitions.update(self._staged.workflow_definitions)
+        self._store.workflow_executions.update(self._staged.workflow_executions)
         for outbox_id, values in self._staged.outbox_updates:
             event = self._store.outbox.get(outbox_id)
             if event is None:
@@ -394,6 +558,8 @@ class MemoryUnitOfWork:
                 event.last_error = values["last_error"]  # type: ignore[assignment]
             if "next_attempt_at" in values:
                 event.next_attempt_at = values["next_attempt_at"]  # type: ignore[assignment]
+            if "dead_lettered_at" in values:
+                event.dead_lettered_at = values["dead_lettered_at"]  # type: ignore[assignment]
         self._store.commits += 1
         self._reset()
 
@@ -412,6 +578,8 @@ class MemoryUnitOfWork:
         self.audit._staged = self._staged
         self.outbox._staged = self._staged
         self.idempotency._staged = self._staged
+        self.workflow_definitions._staged = self._staged
+        self.workflow_executions._staged = self._staged
 
 
 class MemoryUnitOfWorkFactory:

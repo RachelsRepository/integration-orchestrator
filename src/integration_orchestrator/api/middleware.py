@@ -136,6 +136,72 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class InboundRateLimitMiddleware(BaseHTTPMiddleware):
+    """Apply Redis-backed inbound quotas shared across API replicas."""
+
+    async def dispatch(self, request: Request, call_next: RequestHandler) -> Response:
+        path = request.url.path
+        if path.startswith("/health") or path.startswith("/metrics"):
+            return await call_next(request)
+
+        container = getattr(request.app.state, "container", None)
+        limiter = getattr(container, "inbound_rate_limiter", None) if container else None
+        if limiter is None:
+            return await call_next(request)
+
+        # Auth dependencies run after middleware, so resolve subject from the
+        # bearer token when present; otherwise fall back to client IP.
+        scope = _inbound_scope(request, container)
+        if path.startswith("/webhooks"):
+            name, rate, burst, fail_closed = "webhooks", 50.0, 100, True
+        elif request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            name, rate, burst, fail_closed = "mutations", 20.0, 40, True
+        else:
+            name, rate, burst, fail_closed = "reads", 100.0, 200, False
+
+        allowed = await limiter.allow(
+            scope=str(scope),
+            name=name,
+            rate_per_second=rate,
+            burst=burst,
+            fail_closed=fail_closed,
+        )
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "code": "rate_limited",
+                        "message": "inbound rate limit exceeded; retry shortly",
+                        "category": "provider_rate_limit",
+                        "retryable": True,
+                    }
+                },
+            )
+        return await call_next(request)
+
+
+def _inbound_scope(request: Request, container: object) -> str:
+    principal = getattr(request.state, "principal", None)
+    subject = getattr(principal, "subject", None)
+    if subject:
+        return str(subject)
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        verifier = getattr(container, "token_verifier", None)
+        if verifier is not None:
+            try:
+                verified = verifier.verify(token)
+                if verified.subject:
+                    return str(verified.subject)
+            except Exception as exc:
+                logger.debug("inbound rate-limit scope falling back to client host: %s", exc)
+    if request.client:
+        return request.client.host
+    return "anonymous"
+
+
 def _route_template(request: Request) -> str:
     """Return the matched route pattern rather than the concrete path.
 

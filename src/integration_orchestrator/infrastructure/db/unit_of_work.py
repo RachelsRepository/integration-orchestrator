@@ -17,6 +17,7 @@ from types import TracebackType
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from integration_orchestrator.domain.errors import ConflictError
 from integration_orchestrator.infrastructure.db.repositories import (
     SqlAuditRepository,
     SqlIdempotencyRepository,
@@ -24,6 +25,10 @@ from integration_orchestrator.infrastructure.db.repositories import (
     SqlOutboxRepository,
     SqlWebhookReceiptRepository,
     translate_integrity_error,
+)
+from integration_orchestrator.infrastructure.db.workflow_repositories import (
+    SqlWorkflowDefinitionRepository,
+    SqlWorkflowExecutionRepository,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,8 @@ class SqlUnitOfWork:
         self._audit: SqlAuditRepository | None = None
         self._outbox: SqlOutboxRepository | None = None
         self._idempotency: SqlIdempotencyRepository | None = None
+        self._workflow_definitions: SqlWorkflowDefinitionRepository | None = None
+        self._workflow_executions: SqlWorkflowExecutionRepository | None = None
 
     async def __aenter__(self) -> SqlUnitOfWork:
         self._session = self._session_factory()
@@ -50,6 +57,8 @@ class SqlUnitOfWork:
         self._audit = SqlAuditRepository(self._session)
         self._outbox = SqlOutboxRepository(self._session)
         self._idempotency = SqlIdempotencyRepository(self._session)
+        self._workflow_definitions = SqlWorkflowDefinitionRepository(self._session)
+        self._workflow_executions = SqlWorkflowExecutionRepository(self._session)
         return self
 
     async def __aexit__(
@@ -91,6 +100,14 @@ class SqlUnitOfWork:
         return _require(self._idempotency, "idempotency")
 
     @property
+    def workflow_definitions(self) -> SqlWorkflowDefinitionRepository:
+        return _require(self._workflow_definitions, "workflow_definitions")
+
+    @property
+    def workflow_executions(self) -> SqlWorkflowExecutionRepository:
+        return _require(self._workflow_executions, "workflow_executions")
+
+    @property
     def session(self) -> AsyncSession:
         """Direct session access, used only by infrastructure-level helpers."""
         return _require(self._session, "session")
@@ -103,7 +120,10 @@ class SqlUnitOfWork:
             await session.commit()
         except IntegrityError as error:
             await session.rollback()
-            raise translate_integrity_error(error) from error
+            translated = translate_integrity_error(error)
+            if isinstance(translated, ConflictError):
+                raise translated from error
+            raise
         self._committed = True
 
     async def rollback(self) -> None:
@@ -122,7 +142,10 @@ class SqlUnitOfWork:
         try:
             await session.flush()
         except IntegrityError as error:
-            raise translate_integrity_error(error) from error
+            translated = translate_integrity_error(error)
+            if isinstance(translated, ConflictError):
+                raise translated from error
+            raise
 
 
 def _require[T](value: T | None, name: str) -> T:

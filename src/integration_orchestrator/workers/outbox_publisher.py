@@ -13,6 +13,10 @@ consumer that deduplicates on it sees the event once.
 Publication happens outside any database transaction. Holding one open across a
 broker round trip would pin a connection for the duration of a network call and
 would make broker latency into database pressure.
+
+Claimed rows carry a short lease so concurrent publisher replicas do not both
+publish the same unpublished batch under normal concurrency. Exhausted events
+move to a dead-letter state rather than retrying forever.
 """
 
 from __future__ import annotations
@@ -64,18 +68,27 @@ class OutboxPublisherWorker(Worker):
 
     async def run_once(self) -> int:
         now = self._clock.now()
+        lease_until = now + timedelta(seconds=self._settings.outbox_claim_lease_seconds)
 
         async with self._uow_factory() as uow:
-            # The claim locks the batch for this worker, so several publisher
-            # replicas can run without publishing the same event twice.
+            # The claim locks the batch and leases it, so several publisher
+            # replicas can run without publishing the same event twice under
+            # normal concurrency.
             events = list(
-                await uow.outbox.claim_unpublished(now=now, limit=self._settings.outbox_batch_size)
+                await uow.outbox.claim_unpublished(
+                    now=now,
+                    limit=self._settings.outbox_batch_size,
+                    lease_until=lease_until,
+                )
             )
             pending = await uow.outbox.count_pending()
+            dead_lettered = await uow.outbox.count_dead_lettered()
             await uow.commit()
 
         self._metrics.set_gauge("outbox_pending_total", float(pending))
+        self._metrics.set_gauge("outbox_dead_lettered_total", float(dead_lettered))
         if not events:
+            await self._maybe_purge()
             return 0
 
         published, failures = await self._publish(events)
@@ -86,12 +99,21 @@ class OutboxPublisherWorker(Worker):
                     [event.id for event in published], now=self._clock.now()
                 )
             for event, reason in failures:
-                await uow.outbox.mark_failed(
-                    event.id,
-                    error=reason,
-                    next_attempt_at=self._next_attempt_at(event),
-                    now=self._clock.now(),
-                )
+                if event.attempt_count + 1 >= self._settings.outbox_max_attempts:
+                    await uow.outbox.mark_dead_lettered(
+                        event.id, error=reason, now=self._clock.now()
+                    )
+                    self._metrics.increment(
+                        "outbox_dead_lettered_events_total",
+                        labels={"event_type": event.event_type},
+                    )
+                else:
+                    await uow.outbox.mark_failed(
+                        event.id,
+                        error=reason,
+                        next_attempt_at=self._next_attempt_at(event),
+                        now=self._clock.now(),
+                    )
             await uow.commit()
 
         for event in published:
@@ -113,6 +135,23 @@ class OutboxPublisherWorker(Worker):
             },
         )
         return len(events)
+
+    async def _maybe_purge(self) -> None:
+        """Drop old published rows when the queue is idle.
+
+        Running purge only on empty polls keeps the hot path free of a delete
+        that is never urgent: published rows are already invisible to claim.
+        """
+        cutoff = self._clock.now() - timedelta(hours=self._settings.outbox_retention_hours)
+        async with self._uow_factory() as uow:
+            deleted = await uow.outbox.purge_published_before(cutoff)
+            await uow.commit()
+        if deleted:
+            self._metrics.increment("outbox_purged_total", amount=float(deleted))
+            logger.info(
+                "purged published outbox events",
+                extra={"worker": self.name, "deleted": deleted},
+            )
 
     async def _publish(
         self, events: Sequence[OutboxEvent]

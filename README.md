@@ -62,16 +62,18 @@ See [docs/architecture.md](docs/architecture.md) for the layering rules,
 ```bash
 cp .env.example .env
 make install
-make up                 # PostgreSQL, Redis, Kafka, API, workers
+make up                 # PostgreSQL, Redis, Kafka-compatible broker, API, workers
 make migrate
 make token              # prints a local bearer token
 make demo               # walks a request through create → webhook → event
+make compose-e2e        # live Compose probe (API on host port 18100)
+make chaos-subset       # worker/Redis/API recovery probe
 ```
 
-The API listens on `http://localhost:8000`. Interactive docs are at
-`/docs`. The deterministic provider sandbox is mounted at `/__sandbox__` in local
-and test environments only; production configuration refuses to start with it
-enabled.
+The Compose API is published on `http://localhost:18100` (container listens on
+`8000`). Interactive docs are at `/docs`. The deterministic provider sandbox is
+mounted at `/__sandbox__` in local and test environments only; production
+configuration refuses to start with it enabled.
 
 ### Manual request
 
@@ -139,10 +141,11 @@ prefix. See [docs/failure-scenarios.md](docs/failure-scenarios.md).
 
 ## Operations
 
+- [OPERATIONS.md](OPERATIONS.md) — health, DLQ redrive, reconciliation, alerts
 - [Runbooks](docs/runbooks/) — outage response, stuck requests, circuit open, webhook backlog
 - [Failure scenarios](docs/failure-scenarios.md) — what each sandbox scenario exercises
-- [Deployment notes](docs/deployment.md) — Compose, CI, and the Terraform sketch
-- Health: `GET /healthz`, readiness: `GET /readyz`, metrics: `GET /metrics`
+- [Deployment notes](docs/deployment.md) — Compose (local-only), CI, and illustrative Terraform
+- Health: `GET /health/live`, readiness: `GET /health/ready`, metrics: `GET /metrics`
 
 ## Configuration
 
@@ -155,9 +158,48 @@ PROVIDERS__MERIDIAN__RATE_LIMIT_PER_SECOND=10
 ```
 
 Production-like environments refuse to start with development placeholders, the
-provider sandbox enabled, console log rendering, database statement echoing, or
-Kafka disabled. See `.env.example` for the full surface.
+provider sandbox enabled, memory persistence, console log rendering, database
+statement echoing, Kafka disabled, or a placeholder token-encryption secret.
+See `.env.example` for the full surface.
 
+## Verified scope and limitations
+
+This is a **verified reference implementation** of durable single-request and
+multi-step orchestration with **at-least-once** outbox delivery and idempotent
+provider effects. It is **production-inspired**, not a certified or turnkey
+production deployment. See the
+[Production Readiness Boundary](PRODUCTION_READINESS.md#production-readiness-boundary)
+in [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md). Independent security and
+operational review is required before real third-party traffic.
+
+Honest limitations:
+
+- Each deployment is a **single-tenant** unit (one org / one database). Optional
+  subject isolation via `owner_subject` is controlled by
+  `SECURITY__ENFORCE_SUBJECT_ISOLATION` (required in production-like settings).
+  See [SECURITY.md](SECURITY.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
+- Multi-step workflows use one `IntegrationRequest` per step; compensation is
+  reverse-order deprovision/revoke where declared. Workflow (and outbox) claim
+  leases reduce duplicate work under concurrent workers. Dependency-ready
+  promotion supports parallel independent steps; Compose proves sequential
+  `customer_onboarding` and live `parallel_provisioning` fan-out/fan-in.
+  Workflow cancel (`POST /api/v1/workflows/executions/{id}/cancel`) and hard
+  deadlines (`deadline_seconds` on start) are durable and worker-enforced.
+- Compose runs two API replicas (`api` :18100, `api-b` :18101) sharing Postgres,
+  Redis, and Redpanda; `scripts/dual_api_rate_limit.py` proves shared inbound RL.
+- Delivery is at-least-once; exactly-once is not claimed. Consumers must
+  deduplicate on `event_id`.
+- Redis outage policies are risk-based (see ADR 0005): inbound mutations fail
+  closed; provider breakers/rate limits fail open.
+- Compose is local-only (and CI probes); it uses a Kafka-protocol broker
+  (Redpanda). ECS Terraform under `terraform/` is illustrative, not a default
+  production topology.
+- Chaos coverage is an expanded automated suite in `scripts/chaos_subset.py`
+  (worker/API/Redis/provider/stack, cancel, deadline, parallel restart).
+- Live reconciliation matrix: `scripts/recon_matrix.py`.
+- Day-2 ops: [OPERATIONS.md](OPERATIONS.md).
+- Remote GitHub Actions runtime is defined but must be green after commit/push
+  before claiming CI.
 ## License
 
 See [LICENSE](LICENSE).

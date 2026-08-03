@@ -141,8 +141,18 @@ class OutboxRepository(Protocol):
         """Stage several events for publication."""
         ...
 
-    async def claim_unpublished(self, *, now: datetime, limit: int) -> Sequence[OutboxEvent]:
-        """Atomically claim a batch of events awaiting publication."""
+    async def claim_unpublished(
+        self, *, now: datetime, limit: int, lease_until: datetime
+    ) -> Sequence[OutboxEvent]:
+        """Atomically claim a batch of events awaiting publication.
+
+        ``lease_until`` is written onto each claimed row before the transaction
+        commits. Without that lease, two publisher replicas that poll after the
+        claim transaction ends (but before either has marked the rows published)
+        would both select the same events and both publish them. At-least-once
+        delivery already tolerates that on crash-after-ack; the lease stops it
+        from being the steady-state behaviour under normal concurrency.
+        """
         ...
 
     async def mark_published(self, outbox_ids: Sequence[UUID], *, now: datetime) -> None:
@@ -161,8 +171,29 @@ class OutboxRepository(Protocol):
         """Record a publication failure and schedule another attempt."""
         ...
 
+    async def mark_dead_lettered(self, outbox_id: UUID, *, error: str, now: datetime) -> None:
+        """Stop retrying an event that has exhausted its publication budget."""
+        ...
+
     async def count_pending(self) -> int:
-        """Return the number of unpublished events, for the backlog gauge."""
+        """Return unpublished events that are still eligible for publication."""
+        ...
+
+    async def count_dead_lettered(self) -> int:
+        """Return events that exhausted retries and need an operator."""
+        ...
+
+    async def redrive_dead_lettered(self, outbox_ids: Sequence[UUID], *, now: datetime) -> int:
+        """Clear dead-letter marks so claimed events may publish again.
+
+        Returns the number of rows re-armed. Idempotent for ids that are not
+        currently dead-lettered. Does not invent new events — redrive is a
+        controlled operator action against existing outbox rows.
+        """
+        ...
+
+    async def purge_published_before(self, cutoff: datetime) -> int:
+        """Delete published events older than ``cutoff``. Returns the row count."""
         ...
 
 

@@ -134,6 +134,26 @@ class PrometheusMetrics:
             "idempotency_conflicts_total", "Idempotency keys reused with a different body.", ()
         )
         self._gauge("outbox_pending_total", "Outbox events awaiting publication.", ())
+        self._gauge(
+            "outbox_dead_lettered_total",
+            "Outbox events that exhausted publication retries.",
+            (),
+        )
+        self._counter(
+            "outbox_dead_lettered_events_total",
+            "Outbox events newly moved to the dead-letter state.",
+            ("event_type",),
+        )
+        self._counter(
+            "outbox_redriven_total",
+            "Dead-lettered outbox events re-armed by an operator.",
+            (),
+        )
+        self._counter(
+            "outbox_purged_total",
+            "Published outbox rows deleted by retention.",
+            (),
+        )
         self._counter(
             "outbox_publish_failures_total",
             "Outbox publication attempts that failed.",
@@ -141,6 +161,16 @@ class PrometheusMetrics:
         )
         self._counter(
             "outbox_published_total", "Outbox events successfully published.", ("event_type",)
+        )
+        self._counter(
+            "inbound_rate_limit_total",
+            "Inbound API rate-limit decisions.",
+            ("limit", "outcome"),
+        )
+        self._counter(
+            "workflow_executions_total",
+            "Workflow executions reaching a notable status.",
+            ("definition", "status"),
         )
         self._histogram(
             "worker_batch_duration_seconds",

@@ -10,8 +10,10 @@ cost is this module.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from integration_orchestrator.domain.entities import IntegrationRequest, WebhookReceipt
+from integration_orchestrator.domain.enums import OperationType, WorkflowStatus, WorkflowStepStatus
 from integration_orchestrator.domain.records import (
     AuditEvent,
     IdempotencyRecord,
@@ -24,12 +26,21 @@ from integration_orchestrator.domain.value_objects import (
     ProviderSlug,
     SignatureMetadata,
 )
+from integration_orchestrator.domain.workflow import (
+    WorkflowDefinition,
+    WorkflowExecution,
+    WorkflowStepDefinition,
+    WorkflowStepExecution,
+)
 from integration_orchestrator.infrastructure.db.models import (
     AuditEventModel,
     IdempotencyRecordModel,
     IntegrationRequestModel,
     OutboxEventModel,
     WebhookReceiptModel,
+    WorkflowDefinitionModel,
+    WorkflowExecutionModel,
+    WorkflowStepExecutionModel,
 )
 
 
@@ -76,6 +87,7 @@ def request_to_domain(row: IntegrationRequestModel) -> IntegrationRequest:
         completed_at=as_utc_optional(row.completed_at),
         manual_review_reason=row.manual_review_reason,
         version=row.version,
+        owner_subject=row.owner_subject,
     )
 
 
@@ -94,6 +106,7 @@ def request_to_row(request: IntegrationRequest) -> IntegrationRequestModel:
         idempotency_key=request.idempotency_key.value if request.idempotency_key else None,
         attempt_count=request.attempt_count,
         correlation_id=request.correlation_id.value,
+        owner_subject=request.owner_subject,
         last_error_code=request.last_error_code,
         last_error_message=request.last_error_message,
         last_error_category=request.last_error_category,
@@ -251,6 +264,7 @@ def outbox_to_domain(row: OutboxEventModel) -> OutboxEvent:
         attempt_count=row.attempt_count,
         next_attempt_at=as_utc_optional(row.next_attempt_at),
         last_error=row.last_error,
+        dead_lettered_at=as_utc_optional(row.dead_lettered_at),
     )
 
 
@@ -271,6 +285,7 @@ def outbox_to_row(event: OutboxEvent) -> OutboxEventModel:
         attempt_count=event.attempt_count,
         next_attempt_at=event.next_attempt_at,
         last_error=event.last_error,
+        dead_lettered_at=event.dead_lettered_at,
     )
 
 
@@ -293,4 +308,159 @@ def idempotency_to_row(record: IdempotencyRecord) -> IdempotencyRecordModel:
         response_status=record.response_status,
         created_at=record.created_at,
         expires_at=record.expires_at,
+    )
+
+
+def _step_def_from_json(raw: dict[str, Any]) -> WorkflowStepDefinition:
+    compensate = raw.get("compensate_operation")
+    return WorkflowStepDefinition(
+        key=raw["key"],
+        provider=raw["provider"],
+        operation_type=OperationType(raw["operation_type"]),
+        depends_on=tuple(raw.get("depends_on") or ()),
+        compensate_operation=OperationType(compensate) if compensate else None,
+        wait_for_webhook=bool(raw.get("wait_for_webhook", False)),
+        max_attempts=int(raw.get("max_attempts", 3)),
+        payload_template=dict(raw.get("payload_template") or {}),
+    )
+
+
+def _step_def_to_json(step: WorkflowStepDefinition) -> dict[str, Any]:
+    return {
+        "key": step.key,
+        "provider": step.provider,
+        "operation_type": step.operation_type.value,
+        "depends_on": list(step.depends_on),
+        "compensate_operation": (
+            step.compensate_operation.value if step.compensate_operation else None
+        ),
+        "wait_for_webhook": step.wait_for_webhook,
+        "max_attempts": step.max_attempts,
+        "payload_template": dict(step.payload_template),
+    }
+
+
+def workflow_definition_to_domain(row: WorkflowDefinitionModel) -> WorkflowDefinition:
+    return WorkflowDefinition(
+        id=row.id,
+        name=row.name,
+        version=row.version,
+        steps=tuple(_step_def_from_json(s) for s in row.steps),
+        created_at=as_utc(row.created_at),
+        immutable=bool(row.immutable),
+    )
+
+
+def workflow_definition_to_row(definition: WorkflowDefinition) -> WorkflowDefinitionModel:
+    return WorkflowDefinitionModel(
+        id=definition.id,
+        name=definition.name,
+        version=definition.version,
+        steps=[_step_def_to_json(s) for s in definition.steps],
+        immutable=definition.immutable,
+        created_at=definition.created_at,
+    )
+
+
+def workflow_step_to_domain(row: WorkflowStepExecutionModel) -> WorkflowStepExecution:
+    compensate = row.compensate_operation
+    return WorkflowStepExecution(
+        id=row.id,
+        workflow_execution_id=row.workflow_execution_id,
+        step_key=row.step_key,
+        provider=row.provider,
+        operation_type=OperationType(row.operation_type),
+        depends_on=tuple(row.depends_on or ()),
+        compensate_operation=OperationType(compensate) if compensate else None,
+        wait_for_webhook=bool(row.wait_for_webhook),
+        status=WorkflowStepStatus(row.status),
+        attempt_count=row.attempt_count,
+        max_attempts=row.max_attempts,
+        integration_request_id=row.integration_request_id,
+        compensation_request_id=row.compensation_request_id,
+        input_payload=dict(row.input_payload or {}),
+        output_payload=dict(row.output_payload) if row.output_payload is not None else None,
+        error_code=row.error_code,
+        error_message=row.error_message,
+        created_at=as_utc(row.created_at),
+        updated_at=as_utc(row.updated_at),
+        completed_at=as_utc_optional(row.completed_at),
+        version=row.version,
+    )
+
+
+def workflow_step_to_row(step: WorkflowStepExecution) -> WorkflowStepExecutionModel:
+    return WorkflowStepExecutionModel(
+        id=step.id,
+        workflow_execution_id=step.workflow_execution_id,
+        step_key=step.step_key,
+        provider=step.provider,
+        operation_type=step.operation_type.value,
+        depends_on=list(step.depends_on),
+        compensate_operation=(
+            step.compensate_operation.value if step.compensate_operation else None
+        ),
+        wait_for_webhook=step.wait_for_webhook,
+        status=step.status.value,
+        attempt_count=step.attempt_count,
+        max_attempts=step.max_attempts,
+        integration_request_id=step.integration_request_id,
+        compensation_request_id=step.compensation_request_id,
+        input_payload=dict(step.input_payload),
+        output_payload=dict(step.output_payload) if step.output_payload is not None else None,
+        error_code=step.error_code,
+        error_message=step.error_message,
+        version=step.version,
+        created_at=step.created_at,
+        updated_at=step.updated_at,
+        completed_at=step.completed_at,
+    )
+
+
+def workflow_execution_to_domain(
+    row: WorkflowExecutionModel, steps: list[WorkflowStepExecutionModel]
+) -> WorkflowExecution:
+    return WorkflowExecution(
+        id=row.id,
+        definition_id=row.definition_id,
+        definition_name=row.definition_name,
+        definition_version=row.definition_version,
+        status=WorkflowStatus(row.status),
+        correlation_id=row.correlation_id,
+        idempotency_key=row.idempotency_key,
+        input_payload=dict(row.input_payload or {}),
+        steps=[workflow_step_to_domain(s) for s in steps],
+        created_at=as_utc(row.created_at),
+        updated_at=as_utc(row.updated_at),
+        completed_at=as_utc_optional(row.completed_at),
+        manual_review_reason=row.manual_review_reason,
+        version=row.version,
+        owner_subject=row.owner_subject,
+        claim_lease_until=as_utc_optional(row.claim_lease_until),
+        deadline_at=as_utc_optional(row.deadline_at),
+        cancel_reason=row.cancel_reason,
+        deadline_processed_at=as_utc_optional(row.deadline_processed_at),
+    )
+
+
+def workflow_execution_to_row(execution: WorkflowExecution) -> WorkflowExecutionModel:
+    return WorkflowExecutionModel(
+        id=execution.id,
+        definition_id=execution.definition_id,
+        definition_name=execution.definition_name,
+        definition_version=execution.definition_version,
+        status=execution.status.value,
+        correlation_id=execution.correlation_id,
+        idempotency_key=execution.idempotency_key,
+        owner_subject=execution.owner_subject,
+        input_payload=dict(execution.input_payload),
+        manual_review_reason=execution.manual_review_reason,
+        version=execution.version,
+        claim_lease_until=execution.claim_lease_until,
+        deadline_at=execution.deadline_at,
+        cancel_reason=execution.cancel_reason,
+        deadline_processed_at=execution.deadline_processed_at,
+        created_at=execution.created_at,
+        updated_at=execution.updated_at,
+        completed_at=execution.completed_at,
     )

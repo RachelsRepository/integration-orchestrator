@@ -150,6 +150,67 @@ async def test_a_failed_batch_is_retried_one_event_at_a_time(
     assert store.outbox[poison.id].last_error == "this event cannot be routed"
 
 
+async def test_exhausted_publication_attempts_are_dead_lettered(
+    uow_factory: MemoryUnitOfWorkFactory,
+    clock: FrozenClock,
+    metrics: RecordingMetrics,
+    store: MemoryStore,
+) -> None:
+    """Poison events must stop retrying once the budget is spent."""
+
+    class AlwaysFailingPublisher(InMemoryEventPublisher):
+        async def publish_batch(self, envelopes):  # type: ignore[no-untyped-def]
+            raise EventPublicationError("the broker rejected every attempt")
+
+        async def publish(self, envelope):  # type: ignore[no-untyped-def]
+            raise EventPublicationError("the broker rejected every attempt")
+
+    event = make_outbox_event()
+    event.attempt_count = 9
+    store.outbox[event.id] = event
+    worker = OutboxPublisherWorker(
+        uow_factory=uow_factory,
+        publisher=AlwaysFailingPublisher(),
+        clock=clock,
+        metrics=metrics,
+        settings=WorkerSettings(outbox_batch_size=10, outbox_max_attempts=10),
+    )
+
+    assert await worker.run_once() == 1
+
+    assert store.outbox[event.id].dead_lettered_at == REFERENCE_TIME
+    assert store.outbox[event.id].published_at is None
+    assert store.unpublished() == []
+    assert await worker.run_once() == 0
+
+
+async def test_a_claim_lease_stops_a_second_publisher_from_taking_the_same_event(
+    uow_factory: MemoryUnitOfWorkFactory,
+    store: MemoryStore,
+) -> None:
+    event = make_outbox_event()
+    store.outbox[event.id] = event
+
+    async with uow_factory() as first:
+        claimed = await first.outbox.claim_unpublished(
+            now=REFERENCE_TIME,
+            limit=10,
+            lease_until=REFERENCE_TIME + timedelta(seconds=60),
+        )
+        await first.commit()
+
+    assert len(claimed) == 1
+    async with uow_factory() as second:
+        assert (
+            await second.outbox.claim_unpublished(
+                now=REFERENCE_TIME,
+                limit=10,
+                lease_until=REFERENCE_TIME + timedelta(seconds=60),
+            )
+            == []
+        )
+
+
 async def test_a_failed_event_is_not_retried_before_its_backoff_elapses(
     uow_factory: MemoryUnitOfWorkFactory,
     clock: FrozenClock,

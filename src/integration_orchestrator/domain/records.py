@@ -147,6 +147,7 @@ class OutboxEvent:
     attempt_count: int = 0
     next_attempt_at: datetime | None = None
     last_error: str | None = None
+    dead_lettered_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.created_at.tzinfo is None:
@@ -157,6 +158,10 @@ class OutboxEvent:
     @property
     def is_published(self) -> bool:
         return self.published_at is not None
+
+    @property
+    def is_dead_lettered(self) -> bool:
+        return self.dead_lettered_at is not None
 
     @property
     def routing_key(self) -> str:
@@ -173,6 +178,13 @@ class OutboxEvent:
         self.last_error = error[:1000]
         self.next_attempt_at = next_attempt_at
         del now  # retained for signature symmetry with the other mutators
+
+    def mark_dead_lettered(self, *, error: str, now: datetime) -> None:
+        """Stop retrying: the event needs an operator, not another attempt."""
+        self.attempt_count += 1
+        self.last_error = error[:1000]
+        self.next_attempt_at = None
+        self.dead_lettered_at = now
 
 
 @dataclass(frozen=True, slots=True)

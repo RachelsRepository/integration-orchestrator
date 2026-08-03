@@ -107,6 +107,7 @@ class IntegrationRequestModel(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
     correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner_subject: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -144,6 +145,7 @@ class IntegrationRequestModel(Base):
         Index("ix_integration_requests_created_at_id", "created_at", "id"),
         # Reconciliation scans in-flight requests by staleness.
         Index("ix_integration_requests_status_updated_at", "status", "updated_at"),
+        Index("ix_integration_requests_owner_subject", "owner_subject"),
     )
 
 
@@ -252,6 +254,9 @@ class OutboxEventModel(Base):
     )
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         # Stable event ids are what let consumers deduplicate under at-least-once
@@ -259,17 +264,22 @@ class OutboxEventModel(Base):
         UniqueConstraint("event_id", name="uq_outbox_events_event_id"),
         CheckConstraint("event_version >= 1", name="event_version_positive"),
         CheckConstraint("attempt_count >= 0", name="attempt_count_non_negative"),
-        # A partial index over unpublished rows only. The published rows are the
-        # overwhelming majority and the publisher never looks at them, so
-        # indexing them would grow the index without bound for no benefit.
+        # A partial index over unpublished, live rows only. Published and
+        # dead-lettered rows are never claimed, so indexing them would grow the
+        # index without bound for no benefit.
         Index(
             "ix_outbox_events_unpublished",
             "next_attempt_at",
             "created_at",
-            postgresql_where=text("published_at IS NULL"),
+            postgresql_where=text("published_at IS NULL AND dead_lettered_at IS NULL"),
         ),
         Index("ix_outbox_events_published_at_created_at", "published_at", "created_at"),
         Index("ix_outbox_events_aggregate_id", "aggregate_id"),
+        Index(
+            "ix_outbox_events_dead_lettered_at",
+            "dead_lettered_at",
+            postgresql_where=text("dead_lettered_at IS NOT NULL"),
+        ),
     )
 
 
@@ -292,4 +302,117 @@ class IdempotencyRecordModel(Base):
     __table_args__ = (
         Index("ix_idempotency_records_request_id", "request_id"),
         Index("ix_idempotency_records_expires_at", "expires_at"),
+    )
+
+
+class WorkflowDefinitionModel(Base):
+    __tablename__ = "workflow_definitions"
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    steps: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    immutable: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("name", "version", name="uq_workflow_definitions_name_version"),
+    )
+
+
+class WorkflowExecutionModel(Base):
+    __tablename__ = "workflow_executions"
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True)
+    definition_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("workflow_definitions.id"),
+        nullable=False,
+    )
+    definition_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    definition_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    owner_subject: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    input_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    manual_review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    claim_lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deadline_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_workflow_executions_idempotency_key"),
+        Index("ix_workflow_executions_status", "status"),
+        Index("ix_workflow_executions_updated_at", "updated_at"),
+        Index("ix_workflow_executions_owner_subject", "owner_subject"),
+        Index("ix_workflow_executions_claim_lease_until", "claim_lease_until"),
+        Index("ix_workflow_executions_deadline_at", "deadline_at"),
+    )
+
+
+class WorkflowStepExecutionModel(Base):
+    __tablename__ = "workflow_step_executions"
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True)
+    workflow_execution_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("workflow_executions.id"),
+        nullable=False,
+    )
+    step_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False)
+    operation_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    depends_on: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    compensate_operation: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    wait_for_webhook: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="3")
+    integration_request_id: Mapped[UUID | None] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("integration_requests.id"),
+        nullable=True,
+    )
+    compensation_request_id: Mapped[UUID | None] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("integration_requests.id"),
+        nullable=True,
+    )
+    input_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    output_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_execution_id",
+            "step_key",
+            name="uq_workflow_step_executions_execution_step",
+        ),
+        Index("ix_workflow_step_executions_status", "status"),
+        Index("ix_workflow_step_executions_request_id", "integration_request_id"),
     )

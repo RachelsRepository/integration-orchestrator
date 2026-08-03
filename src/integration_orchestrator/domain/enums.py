@@ -125,6 +125,72 @@ class ErrorCategory(StrEnum):
     INTERNAL = "internal"
 
 
+class WorkflowStatus(StrEnum):
+    """Lifecycle of a multi-step workflow execution."""
+
+    CREATED = "created"
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING = "waiting"
+    RETRY_SCHEDULED = "retry_scheduled"
+    COMPENSATING = "compensating"
+    COMPENSATED = "compensated"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    MANUAL_REVIEW = "manual_review"
+    DEAD_LETTERED = "dead_lettered"
+    TIMED_OUT = "timed_out"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in _WORKFLOW_TERMINAL
+
+
+_WORKFLOW_TERMINAL: frozenset[WorkflowStatus] = frozenset(
+    {
+        WorkflowStatus.SUCCEEDED,
+        WorkflowStatus.COMPENSATED,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.CANCELLED,
+        WorkflowStatus.DEAD_LETTERED,
+    }
+)
+
+
+class WorkflowStepStatus(StrEnum):
+    """Lifecycle of one step inside a workflow execution."""
+
+    PENDING = "pending"
+    READY = "ready"
+    RUNNING = "running"
+    WAITING = "waiting"
+    RETRY_SCHEDULED = "retry_scheduled"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    COMPENSATING = "compensating"
+    COMPENSATED = "compensated"
+    CANCELLED = "cancelled"
+    DEAD_LETTERED = "dead_lettered"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in _STEP_TERMINAL
+
+
+_STEP_TERMINAL: frozenset[WorkflowStepStatus] = frozenset(
+    {
+        WorkflowStepStatus.SUCCEEDED,
+        WorkflowStepStatus.FAILED,
+        WorkflowStepStatus.SKIPPED,
+        WorkflowStepStatus.COMPENSATED,
+        WorkflowStepStatus.CANCELLED,
+        WorkflowStepStatus.DEAD_LETTERED,
+    }
+)
+
+
 class AuditAction(StrEnum):
     """Auditable actions.
 
@@ -156,6 +222,19 @@ class AuditAction(StrEnum):
     CIRCUIT_OPENED = "provider.circuit_opened"
     CIRCUIT_CLOSED = "provider.circuit_closed"
     INVALID_TRANSITION_ATTEMPTED = "state.invalid_transition"
+    WORKFLOW_STARTED = "workflow.started"
+    WORKFLOW_STEP_READY = "workflow.step_ready"
+    WORKFLOW_STEP_STARTED = "workflow.step_started"
+    WORKFLOW_STEP_SUCCEEDED = "workflow.step_succeeded"
+    WORKFLOW_STEP_FAILED = "workflow.step_failed"
+    WORKFLOW_WAITING = "workflow.waiting"
+    WORKFLOW_COMPENSATING = "workflow.compensating"
+    WORKFLOW_COMPENSATED = "workflow.compensated"
+    WORKFLOW_SUCCEEDED = "workflow.succeeded"
+    WORKFLOW_FAILED = "workflow.failed"
+    WORKFLOW_MANUAL_REVIEW = "workflow.manual_review"
+    WORKFLOW_CANCELLED = "workflow.cancelled"
+    WORKFLOW_TIMED_OUT = "workflow.timed_out"
 
 
 class ActorType(StrEnum):
@@ -166,4 +245,5 @@ class ActorType(StrEnum):
     RETRY_WORKER = "retry_worker"
     RECONCILIATION_WORKER = "reconciliation_worker"
     OUTBOX_PUBLISHER = "outbox_publisher"
+    WORKFLOW_WORKER = "workflow_worker"
     SYSTEM = "system"

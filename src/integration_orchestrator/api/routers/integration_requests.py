@@ -17,12 +17,14 @@ from fastapi import APIRouter, Header, Query, Response, status
 from integration_orchestrator.api.dependencies import (
     AuditHistoryDep,
     CancelRequestDep,
+    ContainerDep,
     CorrelationDep,
     CreateRequestDep,
     GetRequestDep,
     ListRequestsDep,
     RetryRequestDep,
 )
+from integration_orchestrator.api.ownership import assert_owner_access
 from integration_orchestrator.api.schemas.common import ErrorResponse
 from integration_orchestrator.api.schemas.requests import (
     CancelRequestBody,
@@ -58,6 +60,7 @@ from integration_orchestrator.domain.value_objects import (
     IdempotencyKey,
     ProviderSlug,
 )
+from integration_orchestrator.infrastructure.security.tokens import Scope
 from integration_orchestrator.observability.correlation import set_integration_request_id
 
 router = APIRouter(prefix="/api/v1/integration-requests", tags=["integration requests"])
@@ -133,6 +136,7 @@ async def create_integration_request(
 async def list_integration_requests(
     principal: RequireRequestsRead,
     use_case: ListRequestsDep,
+    container: ContainerDep,
     provider: Annotated[str | None, Query(description="Filter by provider slug.")] = None,
     request_status: Annotated[
         list[RequestStatus] | None,
@@ -158,6 +162,10 @@ async def list_integration_requests(
         cursor=Cursor.decode(cursor) if cursor else None,
     )
     page = await use_case.execute(criteria)
+    enforce = container.settings.security.enforce_subject_isolation
+    if enforce and not principal.has_scope(Scope.OPERATIONS_ADMIN):
+        filtered = [item for item in page.items if item.owner_subject == principal.subject]
+        page = type(page)(items=filtered, next_cursor=None)
     return IntegrationRequestPage.from_domain(page)
 
 
@@ -171,9 +179,16 @@ async def get_integration_request(
     request_id: UUID,
     principal: RequireRequestsRead,
     use_case: GetRequestDep,
+    container: ContainerDep,
 ) -> IntegrationRequestResponse:
     set_integration_request_id(str(request_id))
     request = await use_case.execute(request_id)
+    assert_owner_access(
+        principal=principal,
+        owner_subject=request.owner_subject,
+        enforce=container.settings.security.enforce_subject_isolation,
+        resource_label="integration request",
+    )
     return IntegrationRequestResponse.from_domain(request)
 
 
@@ -187,8 +202,17 @@ async def get_audit_history(
     request_id: UUID,
     principal: RequireRequestsRead,
     use_case: AuditHistoryDep,
+    get_request: GetRequestDep,
+    container: ContainerDep,
 ) -> AuditHistoryResponse:
     set_integration_request_id(str(request_id))
+    request = await get_request.execute(request_id)
+    assert_owner_access(
+        principal=principal,
+        owner_subject=request.owner_subject,
+        enforce=container.settings.security.enforce_subject_isolation,
+        resource_label="integration request",
+    )
     events = await use_case.execute(request_id)
     return AuditHistoryResponse.from_domain(request_id, events)
 
@@ -210,10 +234,19 @@ async def retry_integration_request(
     request_id: UUID,
     principal: RequireRequestsRetry,
     use_case: RetryRequestDep,
+    get_request: GetRequestDep,
+    container: ContainerDep,
     correlation_id: CorrelationDep,
     body: RetryRequestBody | None = None,
 ) -> IntegrationRequestResponse:
     set_integration_request_id(str(request_id))
+    existing = await get_request.execute(request_id)
+    assert_owner_access(
+        principal=principal,
+        owner_subject=existing.owner_subject,
+        enforce=container.settings.security.enforce_subject_isolation,
+        resource_label="integration request",
+    )
     # The retry is scheduled rather than performed inline: the retry worker owns
     # dispatch, so a burst of operator retries cannot saturate the API's
     # connection pool with provider calls.
@@ -249,10 +282,19 @@ async def cancel_integration_request(
     request_id: UUID,
     principal: RequireRequestsCancel,
     use_case: CancelRequestDep,
+    get_request: GetRequestDep,
+    container: ContainerDep,
     correlation_id: CorrelationDep,
     body: CancelRequestBody | None = None,
 ) -> IntegrationRequestResponse:
     set_integration_request_id(str(request_id))
+    existing = await get_request.execute(request_id)
+    assert_owner_access(
+        principal=principal,
+        owner_subject=existing.owner_subject,
+        enforce=container.settings.security.enforce_subject_isolation,
+        resource_label="integration request",
+    )
     request = await use_case.execute(
         CancelRequestCommand(
             request_id=request_id,

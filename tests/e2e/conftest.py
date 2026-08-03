@@ -29,6 +29,7 @@ from integration_orchestrator.api.app import create_app
 from integration_orchestrator.application.services.dispatcher import RequestDispatcher
 from integration_orchestrator.application.services.journal import WorkflowJournal
 from integration_orchestrator.application.services.reconciliation import ReconciliationService
+from integration_orchestrator.application.services.workflow_orchestrator import WorkflowOrchestrator
 from integration_orchestrator.application.use_cases.cancel_request import (
     CancelIntegrationRequestUseCase,
 )
@@ -44,6 +45,12 @@ from integration_orchestrator.application.use_cases.queries import (
 )
 from integration_orchestrator.application.use_cases.retry_request import (
     RetryIntegrationRequestUseCase,
+)
+from integration_orchestrator.application.use_cases.start_workflow import (
+    CancelWorkflowUseCase,
+    GetWorkflowUseCase,
+    RegisterWorkflowDefinitionUseCase,
+    StartWorkflowUseCase,
 )
 from integration_orchestrator.composition import Container, UseCases
 from integration_orchestrator.config.settings import (
@@ -297,6 +304,14 @@ async def harness() -> AsyncIterator[Harness]:
         jitter=RandomJitter(),
         metrics=metrics,
     )
+    workflow_orchestrator = WorkflowOrchestrator(
+        uow_factory=uow_factory,
+        journal=journal,
+        dispatcher=dispatcher,
+        clock=clock,
+        ids=ids,
+    )
+    dispatcher._on_terminal = workflow_orchestrator.on_request_terminal
     reconciliation = ReconciliationService(
         uow_factory=uow_factory,
         registry=registry,
@@ -306,6 +321,13 @@ async def harness() -> AsyncIterator[Harness]:
         stale_after_seconds=settings.workers.reconciliation_stale_after_seconds,
         manual_review_after_seconds=settings.workers.reconciliation_manual_review_after_seconds,
     )
+    register_workflow = RegisterWorkflowDefinitionUseCase(
+        uow_factory=uow_factory, clock=clock, ids=ids
+    )
+
+    class _AllowAllInbound:
+        async def allow(self, **kwargs: Any) -> bool:
+            return True
 
     container = Container(
         settings=settings,
@@ -318,6 +340,7 @@ async def harness() -> AsyncIterator[Harness]:
         journal=journal,
         dispatcher=dispatcher,
         reconciliation=reconciliation,
+        workflow_orchestrator=workflow_orchestrator,
         use_cases=UseCases(
             create_request=CreateIntegrationRequestUseCase(
                 uow_factory=uow_factory,
@@ -345,6 +368,7 @@ async def harness() -> AsyncIterator[Harness]:
                 ids=ids,
                 metrics=metrics,
                 deferred_retry_seconds=0.0001,
+                on_request_updated=workflow_orchestrator.on_request_terminal,
             ),
             list_providers=ListProvidersUseCase(
                 registry=registry,
@@ -352,11 +376,20 @@ async def harness() -> AsyncIterator[Harness]:
                 concurrency=bulkhead,
                 clock=clock,
             ),
+            start_workflow=StartWorkflowUseCase(
+                uow_factory=uow_factory,
+                orchestrator=workflow_orchestrator,
+                register=register_workflow,
+                clock=clock,
+            ),
+            get_workflow=GetWorkflowUseCase(uow_factory=uow_factory),
+            cancel_workflow=CancelWorkflowUseCase(orchestrator=workflow_orchestrator),
         ),
         metrics=metrics,
         token_verifier=TokenVerifier(settings.jwt),
         circuit_breaker=circuit_breaker,  # type: ignore[arg-type]
         rate_limiter=AllowAllRateLimiter(),  # type: ignore[arg-type]
+        inbound_rate_limiter=_AllowAllInbound(),  # type: ignore[arg-type]
         bulkhead=bulkhead,
         clock=clock,
         ids=ids,

@@ -9,7 +9,7 @@
 
 ## Immediate checks
 
-1. Confirm API and workers are healthy: `GET /readyz`, worker process logs.
+1. Confirm API and workers are healthy: `GET /health/ready`, worker process logs.
 2. Confirm the outbox is draining: `outbox_pending` gauge and Kafka producer
    errors.
 3. Identify the stuck population:

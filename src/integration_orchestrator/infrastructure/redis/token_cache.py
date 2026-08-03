@@ -25,12 +25,17 @@ import json
 import logging
 from datetime import UTC, datetime
 
+from cryptography.fernet import Fernet
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from integration_orchestrator.application.ports.security import CachedToken
 from integration_orchestrator.domain.value_objects import ProviderSlug
 from integration_orchestrator.infrastructure.redis.client import KeyBuilder
+from integration_orchestrator.infrastructure.security.token_crypto import (
+    decrypt_token_value,
+    encrypt_token_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +46,10 @@ _MAX_CACHE_SECONDS = 3600
 class RedisTokenCache:
     """Shares provider access tokens across every process."""
 
-    def __init__(self, client: Redis, keys: KeyBuilder) -> None:
+    def __init__(self, client: Redis, keys: KeyBuilder, *, fernet: Fernet) -> None:
         self._client = client
         self._keys = keys
+        self._fernet = fernet
 
     async def get(self, provider: ProviderSlug) -> CachedToken | None:
         try:
@@ -58,8 +64,16 @@ class RedisTokenCache:
             return None
         try:
             data = json.loads(raw)
+            plaintext = decrypt_token_value(self._fernet, data["value"])
+            if plaintext is None:
+                logger.warning(
+                    "discarding a token that could not be decrypted",
+                    extra={"provider": provider.value},
+                )
+                await self.invalidate(provider)
+                return None
             return CachedToken(
-                value=data["value"],
+                value=plaintext,
                 expires_at=datetime.fromisoformat(data["expires_at"]),
                 token_type=data.get("token_type", "Bearer"),
             )
@@ -78,7 +92,7 @@ class RedisTokenCache:
             return
         payload = json.dumps(
             {
-                "value": token.value,
+                "value": encrypt_token_value(self._fernet, token.value),
                 "expires_at": token.expires_at.isoformat(),
                 "token_type": token.token_type,
             }

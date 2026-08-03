@@ -113,6 +113,17 @@ class RedisSettings(BaseModel):
     namespace: str = "integration-orchestrator"
 
 
+class TokenEncryptionSettings(BaseModel):
+    """At-rest encryption for cached provider access tokens.
+
+    Tokens in Redis are Fernet-encrypted with a key derived from ``secret``.
+    Production-like environments refuse the local placeholder so a Redis dump
+    cannot expose live provider credentials.
+    """
+
+    secret: SecretStr = SecretStr("local-development-token-encryption-secret-not-for-production")
+
+
 class KafkaSettings(BaseModel):
     """Kafka producer configuration for outbox publication."""
 
@@ -232,6 +243,18 @@ class WebhookSettings(BaseModel):
     signature_dedupe_ttl_seconds: Annotated[int, Field(ge=60)] = 900
 
 
+class SecuritySettings(BaseModel):
+    """API authorization and object-access policy.
+
+    The platform is a **single-tenant deployment unit**: one database serves one
+    organization. Within that deployment, ``enforce_subject_isolation`` restricts
+    API clients to rows they created (``owner_subject``). Operators holding
+    ``operations:admin`` may inspect and remediate any row.
+    """
+
+    enforce_subject_isolation: bool = False
+
+
 class WorkerSettings(BaseModel):
     """Background worker cadence and batching."""
 
@@ -239,6 +262,13 @@ class WorkerSettings(BaseModel):
     outbox_batch_size: Annotated[int, Field(ge=1, le=1000)] = 100
     outbox_max_attempts: Annotated[int, Field(ge=1)] = 10
     outbox_retry_base_seconds: Annotated[float, Field(gt=0)] = 2.0
+    #: How long a claimed batch is reserved before another publisher may take it.
+    #: Long enough to cover a slow broker round trip; short enough that a crashed
+    #: publisher recovers within a minute rather than an hour.
+    outbox_claim_lease_seconds: Annotated[float, Field(gt=0)] = 60.0
+    #: Published rows older than this are deleted. The outbox is a queue; audit
+    #: rows are the durable history.
+    outbox_retention_hours: Annotated[int, Field(ge=1)] = 168
 
     retry_poll_interval_seconds: Annotated[float, Field(gt=0)] = 2.0
     retry_batch_size: Annotated[int, Field(ge=1, le=500)] = 25
@@ -251,6 +281,16 @@ class WorkerSettings(BaseModel):
     webhook_deferred_retry_seconds: Annotated[float, Field(gt=0)] = 15.0
     webhook_deferred_batch_size: Annotated[int, Field(ge=1, le=500)] = 50
     webhook_deferred_abandon_after_seconds: Annotated[int, Field(ge=60)] = 86_400
+
+    workflow_poll_interval_seconds: Annotated[float, Field(gt=0)] = 2.0
+    workflow_batch_size: Annotated[int, Field(ge=1, le=200)] = 25
+    #: How long a claimed workflow is reserved before another worker may take it.
+    workflow_claim_lease_seconds: Annotated[float, Field(gt=0)] = 60.0
+
+    #: Worker heartbeat file path inside the container; Compose checks freshness.
+    heartbeat_path: str = "/tmp/orchestrator-worker-heartbeat"
+    heartbeat_interval_seconds: Annotated[float, Field(gt=0)] = 5.0
+    heartbeat_stale_after_seconds: Annotated[float, Field(gt=0)] = 30.0
 
     shutdown_grace_seconds: Annotated[float, Field(gt=0)] = 15.0
 
@@ -359,9 +399,15 @@ class Settings(BaseSettings):
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    token_encryption: TokenEncryptionSettings = Field(default_factory=TokenEncryptionSettings)
     kafka: KafkaSettings = Field(default_factory=KafkaSettings)
     jwt: JWTSettings = Field(default_factory=JWTSettings)
+    #: Runtime persistence driver. Compose and production always use PostgreSQL;
+    #: ``memory`` is reserved for isolated unit tests and is rejected when the
+    #: environment is production-like.
+    persistence_driver: Literal["postgres", "memory"] = "postgres"
     webhooks: WebhookSettings = Field(default_factory=WebhookSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
     workers: WorkerSettings = Field(default_factory=WorkerSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     provider_sandbox: ProviderSandboxSettings = Field(default_factory=ProviderSandboxSettings)
@@ -401,8 +447,12 @@ class Settings(BaseSettings):
             problems.append(
                 "the provider sandbox must be disabled outside local and test environments"
             )
+        if self.persistence_driver != "postgres":
+            problems.append("persistence_driver must be postgres; memory state is not durable")
         if self.log_console_renderer:
             problems.append("console log rendering must be disabled; deployed logs must be JSON")
+        if _looks_like_placeholder(self.token_encryption.secret.get_secret_value()):
+            problems.append("TOKEN_ENCRYPTION__SECRET is still the development placeholder")
         if not self.kafka.enabled:
             # With Kafka off the outbox publishes into an in-process list, so
             # every event would be lost on restart while the outbox rows were
@@ -412,6 +462,11 @@ class Settings(BaseSettings):
             )
         if self.database.echo:
             problems.append("database statement echoing must be disabled")
+        if not self.security.enforce_subject_isolation:
+            problems.append(
+                "SECURITY__ENFORCE_SUBJECT_ISOLATION must be true so API clients "
+                "cannot read or mutate each other's workflows by UUID"
+            )
         if self.jwt.algorithm == "HS256" and _looks_like_placeholder(
             self.jwt.secret.get_secret_value()
         ):

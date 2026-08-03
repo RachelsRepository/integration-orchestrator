@@ -148,7 +148,15 @@ async def test_a_distributed_lock_is_held_by_exactly_one_caller(
 
 
 async def test_a_token_is_cached_and_retrieved(redis_client: object) -> None:
-    cache = RedisTokenCache(redis_client, KeyBuilder("test"))  # type: ignore[arg-type]
+    from pydantic import SecretStr
+
+    from integration_orchestrator.infrastructure.security.token_crypto import derive_fernet
+
+    cache = RedisTokenCache(
+        redis_client,  # type: ignore[arg-type]
+        KeyBuilder("test"),
+        fernet=derive_fernet(SecretStr("test-token-encryption-secret")),
+    )
     token = CachedToken(
         value="access-token-1",
         expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
@@ -159,10 +167,22 @@ async def test_a_token_is_cached_and_retrieved(redis_client: object) -> None:
 
     assert cached is not None
     assert cached.value == "access-token-1"
+    # Raw Redis value must not contain the plaintext bearer token.
+    raw = await redis_client.get("test:token:northstar")  # type: ignore[attr-defined]
+    assert raw is not None
+    assert "access-token-1" not in str(raw)
 
 
 async def test_an_already_expired_token_is_not_written(redis_client: object) -> None:
-    cache = RedisTokenCache(redis_client, KeyBuilder("test"))  # type: ignore[arg-type]
+    from pydantic import SecretStr
+
+    from integration_orchestrator.infrastructure.security.token_crypto import derive_fernet
+
+    cache = RedisTokenCache(
+        redis_client,  # type: ignore[arg-type]
+        KeyBuilder("test"),
+        fernet=derive_fernet(SecretStr("test-token-encryption-secret")),
+    )
 
     await cache.set(
         NORTHSTAR,

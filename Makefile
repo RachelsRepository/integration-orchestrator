@@ -129,6 +129,20 @@ down: ## Stop the local stack and remove volumes
 logs: ## Tail application logs
 	docker compose logs -f api workers
 
+.PHONY: compose-e2e
+compose-e2e: ## Run the Compose-level end-to-end probe against a live stack
+	ORCHESTRATOR_BASE_URL=$${ORCHESTRATOR_BASE_URL:-http://localhost:18100} \
+	JWT__SECRET=local-development-signing-secret-not-for-production \
+	ENVIRONMENT=local \
+	$(RUN) python scripts/compose_e2e.py
+
+.PHONY: chaos-subset
+chaos-subset: ## Run the Compose chaos / recovery subset against a live stack
+	ORCHESTRATOR_BASE_URL=$${ORCHESTRATOR_BASE_URL:-http://localhost:18100} \
+	JWT__SECRET=local-development-signing-secret-not-for-production \
+	ENVIRONMENT=local \
+	$(RUN) python scripts/chaos_subset.py
+
 .PHONY: docker-build
 docker-build: ## Build the application image
 	docker build -f docker/Dockerfile -t integration-orchestrator:local .

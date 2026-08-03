@@ -13,6 +13,7 @@ original operation; Meridian ignores the key and happily creates a second one.
 from __future__ import annotations
 
 import itertools
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -57,9 +58,10 @@ class SandboxStore:
         self.attempts = AttemptCounter()
 
     def next_id(self) -> str:
-        # Sequential rather than random so that a failing test names the same
-        # operation on every run.
-        return f"{self._prefix}-{next(self._sequence):08d}"
+        # Sequence keeps logs readable; the random suffix keeps IDs unique across
+        # process restarts so a durable orchestrator database never collides with
+        # a freshly reset in-memory sandbox counter.
+        return f"{self._prefix}-{next(self._sequence):08d}-{uuid.uuid4().hex[:8]}"
 
     def create(
         self,

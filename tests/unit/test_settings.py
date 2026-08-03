@@ -69,6 +69,10 @@ def production(**overrides: object) -> Settings:
         "provider_sandbox": ProviderSandboxSettings(enabled=False, mount_in_app=False),
         "log_console_renderer": False,
         "jwt": {"secret": SecretStr("a-real-signing-secret-from-the-secrets-manager")},
+        "token_encryption": {
+            "secret": SecretStr("a-real-token-encryption-secret-from-the-secrets-manager")
+        },
+        "security": {"enforce_subject_isolation": True},
         "providers": {
             "northstar": northstar_in_production(),
             "meridian": ProviderSettings(enabled=False),
@@ -90,6 +94,11 @@ def test_a_production_configuration_with_real_values_is_accepted() -> None:
     assert production().environment is Environment.PRODUCTION
 
 
+def test_subject_isolation_is_required_in_production() -> None:
+    with pytest.raises(ValidationError, match="SUBJECT_ISOLATION"):
+        production(security={"enforce_subject_isolation": False})
+
+
 def test_the_provider_sandbox_cannot_run_in_production() -> None:
     with pytest.raises(ValidationError, match="sandbox"):
         production(provider_sandbox=ProviderSandboxSettings(enabled=True, mount_in_app=False))
@@ -98,6 +107,20 @@ def test_the_provider_sandbox_cannot_run_in_production() -> None:
 def test_a_placeholder_jwt_secret_stops_production_starting() -> None:
     with pytest.raises(ValidationError, match="JWT__SECRET"):
         production(jwt={"secret": SecretStr("local-development-signing-secret")})
+
+
+def test_a_placeholder_token_encryption_secret_stops_production_starting() -> None:
+    with pytest.raises(ValidationError, match="TOKEN_ENCRYPTION__SECRET"):
+        production(
+            token_encryption={
+                "secret": SecretStr("local-development-token-encryption-secret-not-for-production")
+            }
+        )
+
+
+def test_memory_persistence_is_rejected_in_production() -> None:
+    with pytest.raises(ValidationError, match="persistence_driver"):
+        production(persistence_driver="memory")
 
 
 def test_a_placeholder_provider_credential_stops_production_starting() -> None:

@@ -213,10 +213,20 @@ class CreateIntegrationRequestUseCase:
             correlation_id=command.correlation_id,
             now=now,
             idempotency_key=command.idempotency_key,
+            owner_subject=command.actor.id,
         )
         await uow.requests.add(request)
 
+        # Flush the request before the idempotency row. The two models are not
+        # linked by an ORM relationship, so SQLAlchemy otherwise inserts the
+        # child first and the foreign key rejects it on an empty table — which
+        # the race handler then misreads as a concurrent creation.
         if command.idempotency_key is not None:
+            try:
+                await uow.flush()
+            except ConflictError:
+                await uow.rollback()
+                return None
             await uow.idempotency.add(
                 IdempotencyRecord(
                     key=command.idempotency_key.value,
