@@ -27,7 +27,7 @@ dependencies = [
     "opentelemetry-instrumentation-httpx>=0.49b0",
     "opentelemetry-instrumentation-sqlalchemy>=0.49b0",
     "opentelemetry-instrumentation-asyncpg>=0.49b0",
-    "psycopg[binary]>=3.2.0",
+    "psycopg[binary]>=3.3.4",
 ]
 
 [project.optional-dependencies]
