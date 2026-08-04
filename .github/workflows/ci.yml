@@ -181,7 +181,9 @@ jobs:
           tags: integration-orchestrator:scan
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.28.0
+        # Pin to the immutable commit for v0.36.0 (tag 0.28.0 no longer resolves
+        # after Aqua's post-incident retag to the v-prefixed scheme).
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: integration-orchestrator:scan
           format: table
